@@ -2,6 +2,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+
 from torch.utils.data import (
     DataLoader,
     WeightedRandomSampler
@@ -16,6 +17,21 @@ from dataset import (
 
 
 # ============================================================
+# CONFIGURATION
+# ============================================================
+
+NUM_TELEMETRY = 11
+
+BATCH_SIZE = 32
+EPOCHS = 15
+LEARNING_RATE = 2e-5
+VAL_RATIO = 0.15
+SEED = 42
+
+CHECKPOINT = "model_v8.pth"
+
+
+# ============================================================
 # MODEL
 # ============================================================
 
@@ -26,186 +42,402 @@ class AutonomousDriver(nn.Module):
         super().__init__()
 
         # ====================================================
-        # VISION
+        # VISION BRANCH
+        # Input:
+        #   [B, 3, 200, 400]
+        #
+        # Output:
+        #   [B, 500]
         # ====================================================
 
         self.vision_branch = nn.Sequential(
-            nn.Conv2d(3,32, kernel_size=5, stride=2, padding=2, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=True, padding_mode="zeros"),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((10, 10)),
+
+            nn.Conv2d(
+                3,
+                32,
+                kernel_size=5,
+                stride=2,
+                padding=2
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                32,
+                64,
+                kernel_size=5,
+                stride=2,
+                padding=2
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                64,
+                128,
+                kernel_size=5,
+                stride=2,
+                padding=2
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(
+                128,
+                128,
+                kernel_size=3,
+                stride=1,
+                padding=1
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.AdaptiveAvgPool2d(
+                (10, 10)
+            ),
+
             nn.Flatten(),
-            nn.Linear(128 * 10 * 10, 256),
-            nn.ReLU(),
-            nn.Linear(256, 500),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+
+            nn.Linear(
+                128 * 10 * 10,
+                256
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                256,
+                500
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Dropout(
+                0.2
+            )
         )
 
         # ====================================================
         # VEHICLE STATE
         #
-        # speed
-        # speed_limit
-        # angle
-        # theta
+        # Telemetry:
+        #
+        # 0 speed
+        # 6 speed_limit
+        # 7 angle
+        # 9 theta
+        # 10 lateral_distance
+        #
+        # Total = 5
+        #
+        # Output = 64
         # ====================================================
 
         self.vehicle_state_branch = nn.Sequential(
-            nn.Linear(4, 32),
+
+            nn.Linear(
+                5,
+                32
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Linear(32, 64),
+
+            nn.Linear(
+                32,
+                64
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
+
+            nn.Linear(
+                64,
+                64
+            ),
+
             nn.ReLU(inplace=True)
         )
 
         # ====================================================
         # JUNCTION
+        #
+        # Telemetry:
+        #
+        # 2 junction
+        #
+        # Output = 32
         # ====================================================
 
         self.junction_state_branch = nn.Sequential(
-            nn.Linear(1, 16),
+
+            nn.Linear(
+                1,
+                16
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Linear(16, 32),
+
+            nn.Linear(
+                16,
+                32
+            ),
+
             nn.ReLU(inplace=True)
         )
 
         # ====================================================
         # COMMAND
+        #
+        # Values:
+        #
+        # 1 LEFT
+        # 2 RIGHT
+        # 3 STRAIGHT
+        # 4 LANEFOLLOW
+        # 5 CHANGE_LANE_LEFT
+        # 6 CHANGE_LANE_RIGHT
+        #
+        # 0 is reserved.
         # ====================================================
 
-        self.command_embedding = nn.Embedding(7, 32)
+        self.command_embedding = nn.Embedding(
+            7,
+            32
+        )
 
         # ====================================================
         # NEXT COMMAND
         # ====================================================
 
-        self.next_command_embedding = nn.Embedding(7, 32)
+        self.next_command_embedding = nn.Embedding(
+            7,
+            32
+        )
 
         # ====================================================
         # OBJECT TYPE
+        #
+        # 0 None
+        # 1 stop
+        # 2 traffic light
+        # 3 vehicle
+        # 4 pedestrian
         # ====================================================
 
-        self.object_type_embedding = nn.Embedding(5, 16)
+        self.object_type_embedding = nn.Embedding(
+            5,
+            16
+        )
 
         # ====================================================
         # OBJECT STATE
         #
-        # 16 object embedding
-        # + 1 object id
-        # + 1 object distance
-        # = 18
+        # 16 object-type embedding
+        # 1 object ID
+        # 1 object distance
+        #
+        # Total = 18
+        #
+        # Output = 64
         # ====================================================
 
         self.object_state_branch = nn.Sequential(
-            nn.Linear(18, 32),
+
+            nn.Linear(
+                18,
+                32
+            ),
+
             nn.ReLU(inplace=True),
-            nn.Linear(32, 64),
+
+            nn.Linear(
+                32,
+                64
+            ),
+
             nn.ReLU(inplace=True)
         )
 
         # ====================================================
         # FUSION
         #
-        # 64 vehicle
-        # 32 junction
-        # 32 command
-        # 32 next command
-        # 64 object
-        # 500 vision
-        # ----------------
-        # = 724
+        # Vehicle       = 64
+        # Junction      = 32
+        # Command       = 32
+        # Next command  = 32
+        # Object        = 64
+        # Vision        = 500
+        #
+        # TOTAL         = 724
         # ====================================================
 
         self.fusion_branch = nn.Sequential(
-            nn.Linear(724, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
+
+            nn.Linear(
+                724,
+                256
+            ),
+
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                256,
+                128
+            ),
+
+            nn.ReLU(inplace=True)
         )
 
         # ====================================================
-        # STEERING
+        # STEERING HEAD
+        #
+        # Output range:
+        # [-1, 1]
         # ====================================================
 
         self.steering_head = nn.Sequential(
-            nn.Linear(128, 1),
+
+            nn.Linear(
+                128,
+                1
+            ),
+
             nn.Tanh()
         )
 
         # ====================================================
-        # THROTTLE
+        # THROTTLE HEAD
+        #
+        # Output range:
+        # [0, 1]
         # ====================================================
 
         self.throttle_head = nn.Sequential(
-            nn.Linear(128, 1),
+
+            nn.Linear(
+                128,
+                1
+            ),
+
             nn.Sigmoid()
         )
 
         # ====================================================
-        # BRAKE
+        # BRAKE HEAD
         #
-        # Brake is still a TARGET.
-        # It is NOT an input anymore.
+        # IMPORTANT:
+        #
+        # This outputs a LOGIT.
+        #
+        # sigmoid() is applied only when interpreting
+        # the output as a probability.
         # ====================================================
 
-        self.brake_head = nn.Linear(128, 1)
+        self.brake_head = nn.Linear(
+            128,
+            1
+        )
 
     # ========================================================
     # FORWARD
     # ========================================================
 
-    def forward(self, image_input, telemetry_input):
+    def forward(
+        self,
+        image_input,
+        telemetry_input
+    ):
+
+        # ====================================================
+        # CHECK TELEMETRY
+        # ====================================================
+
         if telemetry_input.ndim != 2:
+
             raise RuntimeError(
-                "Telemetry must be [batch, 10]. "
+                "Telemetry must have shape [B, 11]. "
                 f"Got {telemetry_input.shape}"
             )
 
-        if telemetry_input.shape[1] != 10:
+        if telemetry_input.shape[1] != NUM_TELEMETRY:
+
             raise RuntimeError(
-                "Model expects exactly 10 telemetry values. "
+                "Model expects exactly "
+                f"{NUM_TELEMETRY} telemetry values. "
                 f"Got {telemetry_input.shape[1]}"
             )
 
         # ====================================================
-        # TELEMETRY
+        # TELEMETRY INDICES
         #
-        # 0 speed
-        # 1 command
-        # 2 junction
-        # 3 object_type
-        # 4 object_id
-        # 5 object_distance
-        # 6 speed_limit
-        # 7 angle
-        # 8 next_command
-        # 9 theta
+        # 0  speed
+        # 1  command
+        # 2  junction
+        # 3  object_type
+        # 4  object_id
+        # 5  object_distance
+        # 6  speed_limit
+        # 7  angle
+        # 8  next_command
+        # 9  theta
+        # 10 lateral_distance
         # ====================================================
 
-        speed = (telemetry_input[:, 0:1])
-        command = (telemetry_input[:, 1].long())
-        junction = (telemetry_input[:, 2:3])
-        object_type = (telemetry_input[:, 3].long())
-        object_id = (telemetry_input[:, 4:5])
-        object_distance = (telemetry_input[:, 5:6])
-        speed_limit = (telemetry_input[:, 6:7])
-        angle = (telemetry_input[:, 7:8])
-        next_command = (telemetry_input[:, 8].long())
-        theta = (telemetry_input[:, 9:10])
+        speed = telemetry_input[:, 0:1]
+
+        command = (
+            telemetry_input[:, 1]
+            .long()
+            .clamp(0, 6)
+        )
+
+        junction = telemetry_input[:, 2:3]
+
+        object_type = (
+            telemetry_input[:, 3]
+            .long()
+            .clamp(0, 4)
+        )
+
+        object_id = telemetry_input[:, 4:5]
+
+        object_distance = telemetry_input[:, 5:6]
+
+        speed_limit = telemetry_input[:, 6:7]
+
+        angle = telemetry_input[:, 7:8]
+
+        next_command = (
+            telemetry_input[:, 8]
+            .long()
+            .clamp(0, 6)
+        )
+
+        theta = telemetry_input[:, 9:10]
+
+        lateral_distance = telemetry_input[:, 10:11]
 
         # ====================================================
-        # VEHICLE
+        # VEHICLE STATE
         # ====================================================
 
         vehicle_state = torch.cat(
@@ -213,7 +445,8 @@ class AutonomousDriver(nn.Module):
                 speed,
                 speed_limit,
                 angle,
-                theta
+                theta,
+                lateral_distance
             ),
             dim=1
         )
@@ -255,7 +488,7 @@ class AutonomousDriver(nn.Module):
         )
 
         # ====================================================
-        # OBJECT
+        # OBJECT TYPE
         # ====================================================
 
         object_type_features = (
@@ -263,6 +496,10 @@ class AutonomousDriver(nn.Module):
                 object_type
             )
         )
+
+        # ====================================================
+        # OBJECT STATE
+        # ====================================================
 
         object_state = torch.cat(
             (
@@ -280,7 +517,7 @@ class AutonomousDriver(nn.Module):
         )
 
         # ====================================================
-        # VISION
+        # IMAGE
         # ====================================================
 
         vision_features = (
@@ -308,7 +545,7 @@ class AutonomousDriver(nn.Module):
         if combined_features.shape[1] != 724:
 
             raise RuntimeError(
-                "Fusion size mismatch. "
+                "Fusion feature size mismatch. "
                 f"Expected 724, "
                 f"got {combined_features.shape[1]}"
             )
@@ -323,29 +560,35 @@ class AutonomousDriver(nn.Module):
         # OUTPUTS
         # ====================================================
 
-        steering_output = (
+        steering = (
             self.steering_head(
                 fused_features
             )
         )
 
-        throttle_output = (
+        throttle = (
             self.throttle_head(
                 fused_features
             )
         )
 
-        brake_output = (
+        brake_logit = (
             self.brake_head(
                 fused_features
             )
         )
 
+        # ====================================================
+        # FINAL OUTPUT
+        #
+        # [steering, throttle, brake_logit]
+        # ====================================================
+
         return torch.cat(
             (
-                steering_output,
-                throttle_output,
-                brake_output
+                steering,
+                throttle,
+                brake_logit
             ),
             dim=1
         )
@@ -364,11 +607,19 @@ def train_model(
     learning_rate=2e-5
 ):
 
+    # ========================================================
+    # OPTIMIZER
+    # ========================================================
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         weight_decay=1e-4
     )
+
+    # ========================================================
+    # LOSSES
+    # ========================================================
 
     regression_criterion = nn.HuberLoss(
         reduction="none"
@@ -377,6 +628,12 @@ def train_model(
     brake_criterion = nn.BCEWithLogitsLoss(
         reduction="none"
     )
+
+    # ========================================================
+    # OUTPUT WEIGHTS
+    #
+    # Steering receives 2x weight.
+    # ========================================================
 
     output_weights = torch.tensor(
         [
@@ -392,13 +649,13 @@ def train_model(
     best_epoch = 0
 
     # ========================================================
-    # EPOCHS
+    # EPOCH LOOP
     # ========================================================
 
     for epoch in range(epochs):
 
         # ====================================================
-        # TRAIN
+        # TRAIN MODE
         # ====================================================
 
         model.train()
@@ -411,6 +668,10 @@ def train_model(
         )
 
         train_samples = 0
+
+        # ====================================================
+        # TRAIN BATCHES
+        # ====================================================
 
         for batch_idx, (
             images,
@@ -436,13 +697,29 @@ def train_model(
                 non_blocking=True
             )
 
-            if telemetry.shape[1] != 10:
+            # ------------------------------------------------
+            # VALIDATION OF INPUT SHAPES
+            # ------------------------------------------------
+
+            if telemetry.shape[1] != NUM_TELEMETRY:
 
                 raise RuntimeError(
                     "Training dataset returned "
                     f"{telemetry.shape[1]} telemetry values. "
-                    "Expected 10."
+                    f"Expected {NUM_TELEMETRY}."
                 )
+
+            if targets.shape[1] != 3:
+
+                raise RuntimeError(
+                    "Training dataset returned "
+                    f"{targets.shape[1]} targets. "
+                    "Expected 3."
+                )
+
+            # ------------------------------------------------
+            # NUMERICAL CHECK
+            # ------------------------------------------------
 
             if not torch.isfinite(images).all():
 
@@ -462,50 +739,53 @@ def train_model(
                     "Targets contain NaN/Inf."
                 )
 
+            # ------------------------------------------------
+            # ZERO GRADIENT
+            # ------------------------------------------------
+
             optimizer.zero_grad(
                 set_to_none=True
             )
+
+            # ------------------------------------------------
+            # FORWARD
+            # ------------------------------------------------
 
             outputs = model(
                 images,
                 telemetry
             )
 
-            # ------------------------------------------------
-            # STEERING
-            # ------------------------------------------------
+            # =================================================
+            # STEERING LOSS
+            # =================================================
 
-            steer_loss = (
-                regression_criterion(
-                    outputs[:, 0],
-                    targets[:, 0]
-                )
+            steer_loss = regression_criterion(
+                outputs[:, 0],
+                targets[:, 0]
             )
 
-            # ------------------------------------------------
-            # THROTTLE
-            # ------------------------------------------------
+            # =================================================
+            # THROTTLE LOSS
+            # =================================================
 
-            throttle_loss = (
-                regression_criterion(
-                    outputs[:, 1],
-                    targets[:, 1]
-                )
+            throttle_loss = regression_criterion(
+                outputs[:, 1],
+                targets[:, 1]
             )
 
-            # ------------------------------------------------
-            # BRAKE
-            #
-            # Target only.
-            # No brake input.
-            # ------------------------------------------------
+            # =================================================
+            # BRAKE LOSS
+            # =================================================
 
-            brake_loss = (
-                brake_criterion(
-                    outputs[:, 2],
-                    targets[:, 2]
-                )
+            brake_loss = brake_criterion(
+                outputs[:, 2],
+                targets[:, 2]
             )
+
+            # =================================================
+            # COMBINE
+            # =================================================
 
             individual_loss = torch.stack(
                 (
@@ -523,6 +803,10 @@ def train_model(
 
             loss = weighted_loss.mean()
 
+            # =================================================
+            # BACKPROP
+            # =================================================
+
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -532,18 +816,21 @@ def train_model(
 
             optimizer.step()
 
+            # =================================================
+            # METRICS
+            # =================================================
+
             batch_size = images.size(0)
 
             running_loss += (
-                loss.item() * batch_size
+                loss.item()
+                * batch_size
             )
 
             with torch.no_grad():
 
-                brake_probability = (
-                    torch.sigmoid(
-                        outputs[:, 2]
-                    )
+                brake_probability = torch.sigmoid(
+                    outputs[:, 2]
                 )
 
                 brake_prediction = (
@@ -554,27 +841,36 @@ def train_model(
                     (
                         torch.abs(
                             outputs[:, 0]
-                            - targets[:, 0]
+                            -
+                            targets[:, 0]
                         ),
 
                         torch.abs(
                             outputs[:, 1]
-                            - targets[:, 1]
+                            -
+                            targets[:, 1]
                         ),
 
                         torch.abs(
                             brake_prediction
-                            - targets[:, 2]
+                            -
+                            targets[:, 2]
                         )
                     ),
                     dim=1
                 )
 
                 train_absolute_error += (
-                    batch_error.sum(dim=0)
+                    batch_error.sum(
+                        dim=0
+                    )
                 )
 
             train_samples += batch_size
+
+            # ------------------------------------------------
+            # PROGRESS
+            # ------------------------------------------------
 
             if batch_idx % 100 == 0:
 
@@ -585,13 +881,20 @@ def train_model(
                     f"{running_loss / train_samples:.4f}"
                 )
 
+        # ====================================================
+        # TRAIN METRICS
+        # ====================================================
+
         train_loss = (
-            running_loss / train_samples
+            running_loss
+            /
+            max(train_samples, 1)
         )
 
         train_mae = (
             train_absolute_error
-            / train_samples
+            /
+            max(train_samples, 1)
         )
 
         # ====================================================
@@ -614,16 +917,28 @@ def train_model(
 
         val_samples = 0
 
+        # ====================================================
+        # BRAKE CONFUSION MATRIX
+        # ====================================================
+
         brake_tp = 0
         brake_tn = 0
         brake_fp = 0
         brake_fn = 0
+
+        # ====================================================
+        # STEERING METRICS
+        # ====================================================
 
         steer_sign_correct = 0
         steer_sign_total = 0
 
         strong_steer_error = 0.0
         strong_steer_samples = 0
+
+        # ====================================================
+        # VALIDATION LOOP
+        # ====================================================
 
         with torch.no_grad():
 
@@ -648,38 +963,44 @@ def train_model(
                     non_blocking=True
                 )
 
-                if telemetry.shape[1] != 10:
+                # ------------------------------------------------
+                # SHAPE CHECK
+                # ------------------------------------------------
+
+                if telemetry.shape[1] != NUM_TELEMETRY:
 
                     raise RuntimeError(
                         "Validation dataset returned "
-                        f"{telemetry.shape[1]} values. "
-                        "Expected 10."
+                        f"{telemetry.shape[1]} telemetry values. "
+                        f"Expected {NUM_TELEMETRY}."
                     )
+
+                # ------------------------------------------------
+                # FORWARD
+                # ------------------------------------------------
 
                 outputs = model(
                     images,
                     telemetry
                 )
 
-                steer_loss = (
-                    regression_criterion(
-                        outputs[:, 0],
-                        targets[:, 0]
-                    )
+                # =================================================
+                # LOSSES
+                # =================================================
+
+                steer_loss = regression_criterion(
+                    outputs[:, 0],
+                    targets[:, 0]
                 )
 
-                throttle_loss = (
-                    regression_criterion(
-                        outputs[:, 1],
-                        targets[:, 1]
-                    )
+                throttle_loss = regression_criterion(
+                    outputs[:, 1],
+                    targets[:, 1]
                 )
 
-                brake_loss = (
-                    brake_criterion(
-                        outputs[:, 2],
-                        targets[:, 2]
-                    )
+                brake_loss = brake_criterion(
+                    outputs[:, 2],
+                    targets[:, 2]
                 )
 
                 individual_loss = torch.stack(
@@ -701,54 +1022,64 @@ def train_model(
                 batch_size = images.size(0)
 
                 val_loss_total += (
-                    loss.item() * batch_size
+                    loss.item()
+                    * batch_size
                 )
 
                 val_output_loss += (
-                    individual_loss.sum(dim=0)
+                    individual_loss.sum(
+                        dim=0
+                    )
                 )
 
-                # ------------------------------------------------
-                # Predictions
-                # ------------------------------------------------
+                # =================================================
+                # BRAKE PREDICTION
+                # =================================================
 
-                brake_probability = (
-                    torch.sigmoid(
-                        outputs[:, 2]
-                    )
+                brake_probability = torch.sigmoid(
+                    outputs[:, 2]
                 )
 
                 brake_prediction = (
                     brake_probability >= 0.5
                 ).float()
 
+                # =================================================
+                # MAE
+                # =================================================
+
                 batch_error = torch.stack(
                     (
                         torch.abs(
                             outputs[:, 0]
-                            - targets[:, 0]
+                            -
+                            targets[:, 0]
                         ),
 
                         torch.abs(
                             outputs[:, 1]
-                            - targets[:, 1]
+                            -
+                            targets[:, 1]
                         ),
 
                         torch.abs(
                             brake_prediction
-                            - targets[:, 2]
+                            -
+                            targets[:, 2]
                         )
                     ),
                     dim=1
                 )
 
                 val_absolute_error += (
-                    batch_error.sum(dim=0)
+                    batch_error.sum(
+                        dim=0
+                    )
                 )
 
-                # ------------------------------------------------
-                # Brake confusion
-                # ------------------------------------------------
+                # =================================================
+                # BRAKE CONFUSION MATRIX
+                # =================================================
 
                 actual_brake = targets[:, 2]
 
@@ -792,14 +1123,16 @@ def train_model(
                     .item()
                 )
 
-                # ------------------------------------------------
-                # Steering sign
-                # ------------------------------------------------
+                # =================================================
+                # STEERING SIGN ACCURACY
+                # =================================================
 
                 meaningful = (
                     torch.abs(
                         targets[:, 0]
-                    ) >= 0.05
+                    )
+                    >=
+                    0.05
                 )
 
                 if meaningful.any():
@@ -813,7 +1146,11 @@ def train_model(
                     )
 
                     steer_sign_correct += (
-                        (true_sign == pred_sign)
+                        (
+                            true_sign
+                            ==
+                            pred_sign
+                        )
                         .sum()
                         .item()
                     )
@@ -822,26 +1159,28 @@ def train_model(
                         meaningful.sum().item()
                     )
 
-                # ------------------------------------------------
-                # Strong turns
-                # ------------------------------------------------
+                # =================================================
+                # STRONG TURN MAE
+                # =================================================
 
                 strong = (
                     torch.abs(
                         targets[:, 0]
-                    ) >= 0.25
+                    )
+                    >=
+                    0.25
                 )
 
                 if strong.any():
 
-                    error = torch.abs(
+                    strong_error = torch.abs(
                         outputs[:, 0][strong]
                         -
                         targets[:, 0][strong]
                     )
 
                     strong_steer_error += (
-                        error.sum().item()
+                        strong_error.sum().item()
                     )
 
                     strong_steer_samples += (
@@ -851,61 +1190,81 @@ def train_model(
                 val_samples += batch_size
 
         # ====================================================
-        # METRICS
+        # VALIDATION METRICS
         # ====================================================
 
         val_loss = (
-            val_loss_total / val_samples
+            val_loss_total
+            /
+            max(val_samples, 1)
         )
 
         val_mae = (
             val_absolute_error
-            / val_samples
+            /
+            max(val_samples, 1)
         )
 
         val_output_loss_avg = (
             val_output_loss
-            / val_samples
+            /
+            max(val_samples, 1)
         )
+
+        # ====================================================
+        # BRAKE METRICS
+        # ====================================================
 
         brake_total = (
             brake_tp
-            + brake_tn
-            + brake_fp
-            + brake_fn
+            +
+            brake_tn
+            +
+            brake_fp
+            +
+            brake_fn
         )
 
         brake_accuracy = (
             (brake_tp + brake_tn)
-            / brake_total
+            /
+            brake_total
             if brake_total > 0
             else 0.0
         )
 
         brake_precision = (
             brake_tp
-            / (brake_tp + brake_fp)
+            /
+            (brake_tp + brake_fp)
             if (brake_tp + brake_fp) > 0
             else 0.0
         )
 
         brake_recall = (
             brake_tp
-            / (brake_tp + brake_fn)
+            /
+            (brake_tp + brake_fn)
             if (brake_tp + brake_fn) > 0
             else 0.0
         )
 
+        # ====================================================
+        # STEERING METRICS
+        # ====================================================
+
         steer_sign_accuracy = (
             steer_sign_correct
-            / steer_sign_total
+            /
+            steer_sign_total
             if steer_sign_total > 0
             else 0.0
         )
 
         strong_turn_mae = (
             strong_steer_error
-            / strong_steer_samples
+            /
+            strong_steer_samples
             if strong_steer_samples > 0
             else 0.0
         )
@@ -946,15 +1305,20 @@ def train_model(
 
         print(
             f"Steer Metrics | "
-            f"Sign Accuracy: {steer_sign_accuracy:.4f} | "
-            f"Strong-turn MAE: {strong_turn_mae:.4f}"
+            f"Sign Accuracy: "
+            f"{steer_sign_accuracy:.4f} | "
+            f"Strong-turn MAE: "
+            f"{strong_turn_mae:.4f}"
         )
 
         print(
             f"Brake Metrics | "
-            f"Accuracy: {brake_accuracy:.4f} | "
-            f"Precision: {brake_precision:.4f} | "
-            f"Recall: {brake_recall:.4f}"
+            f"Accuracy: "
+            f"{brake_accuracy:.4f} | "
+            f"Precision: "
+            f"{brake_precision:.4f} | "
+            f"Recall: "
+            f"{brake_recall:.4f}"
         )
 
         print(
@@ -968,7 +1332,7 @@ def train_model(
         print("=" * 80)
 
         # ====================================================
-        # SAVE BEST
+        # SAVE BEST MODEL
         # ====================================================
 
         if val_loss < best_val_loss:
@@ -978,12 +1342,12 @@ def train_model(
 
             torch.save(
                 model.state_dict(),
-                "model_v5.pth"
+                CHECKPOINT
             )
 
             print(
-                ">>> Validation loss decreased! "
-                "Saved model_v5.pth <<<"
+                f">>> Validation loss decreased! "
+                f"Saved {CHECKPOINT} <<<"
             )
 
     # ========================================================
@@ -1007,7 +1371,7 @@ def train_model(
     )
 
     print(
-        "Checkpoint: model_v5.pth"
+        f"Checkpoint: {CHECKPOINT}"
     )
 
     print("=" * 80)
@@ -1019,24 +1383,35 @@ def train_model(
 
 if __name__ == "__main__":
 
+    # ========================================================
+    # DATA PATHS
+    # ========================================================
+
     BASE_PATHS = [
         "./PDM_Lite_Carla_LB2_Data/Town01/data/*",
         "./PDM_Lite_Carla_LB2_Data/Town02/data/*",
         "./PDM_Lite_Carla_LB2_Data/Town03/data/*/*",
     ]
 
-    BATCH_SIZE = 32
-    EPOCHS = 15
-    LEARNING_RATE = 2e-5
-    VAL_RATIO = 0.15
-    SEED = 42
+    # ========================================================
+    # RANDOM SEEDS
+    # ========================================================
 
     random.seed(SEED)
+
     np.random.seed(SEED)
+
     torch.manual_seed(SEED)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
+
+        torch.cuda.manual_seed_all(
+            SEED
+        )
+
+    # ========================================================
+    # DEVICE
+    # ========================================================
 
     device = torch.device(
         "cuda"
@@ -1044,28 +1419,29 @@ if __name__ == "__main__":
         else "cpu"
     )
 
+    # ========================================================
+    # HEADER
+    # ========================================================
+
     print()
     print("=" * 80)
 
     print(
-        "PDM-LITE NEURAL DRIVER TRAINING V5"
+        "PDM-LITE NEURAL DRIVER TRAINING V8"
     )
 
     print("=" * 80)
 
     print(
-        "Device:",
-        device
+        f"Device: {device}"
     )
 
     print(
-        "Telemetry:",
-        10
+        f"Telemetry: {NUM_TELEMETRY}"
     )
 
     print(
-        "Checkpoint:",
-        "model_v5.pth"
+        f"Checkpoint: {CHECKPOINT}"
     )
 
     print(
@@ -1077,7 +1453,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "  normal Huber steering loss"
+        "  Huber steering loss"
     )
 
     print(
@@ -1088,10 +1464,30 @@ if __name__ == "__main__":
         "  REMOVED"
     )
 
+    print(
+        "Brake:"
+    )
+
+    print(
+        "  target only"
+    )
+
+    print(
+        "Lateral distance:"
+    )
+
+    print(
+        "  route-based"
+    )
+
+    print(
+        "  normalized to [-1, 1]"
+    )
+
     print("=" * 80)
 
     # ========================================================
-    # INDEX
+    # BUILD INDEX
     # ========================================================
 
     master_list = build_path_index(
@@ -1103,14 +1499,14 @@ if __name__ == "__main__":
         len(master_list)
     )
 
-    if not master_list:
+    if len(master_list) == 0:
 
         raise RuntimeError(
             "No training samples found."
         )
 
     # ========================================================
-    # DISTRIBUTION
+    # DATASET DISTRIBUTION
     # ========================================================
 
     summarize_steering_distribution(
@@ -1118,16 +1514,21 @@ if __name__ == "__main__":
     )
 
     # ========================================================
-    # SPLIT
+    # SHUFFLE
     # ========================================================
 
     random.shuffle(
         master_list
     )
 
+    # ========================================================
+    # TRAIN / VALIDATION SPLIT
+    # ========================================================
+
     val_size = int(
         len(master_list)
-        * VAL_RATIO
+        *
+        VAL_RATIO
     )
 
     val_list = master_list[
@@ -1189,27 +1590,41 @@ if __name__ == "__main__":
         tuple(sample_target.shape)
     )
 
-    if sample_telemetry.numel() != 10:
+    # --------------------------------------------------------
+    # IMAGE CHECK
+    # --------------------------------------------------------
 
-        raise RuntimeError(
-            "Dataset must return exactly "
-            "10 telemetry values."
-        )
-
-    if sample_image.shape != (
+    if tuple(sample_image.shape) != (
         3,
         200,
         400
     ):
 
         raise RuntimeError(
-            "Unexpected image shape."
+            "Unexpected image shape: "
+            f"{sample_image.shape}"
         )
+
+    # --------------------------------------------------------
+    # TELEMETRY CHECK
+    # --------------------------------------------------------
+
+    if sample_telemetry.numel() != NUM_TELEMETRY:
+
+        raise RuntimeError(
+            "Dataset must return exactly "
+            f"{NUM_TELEMETRY} telemetry values."
+        )
+
+    # --------------------------------------------------------
+    # TARGET CHECK
+    # --------------------------------------------------------
 
     if sample_target.numel() != 3:
 
         raise RuntimeError(
-            "Expected target shape [3]."
+            "Dataset must return exactly "
+            "3 targets."
         )
 
     print(
@@ -1217,7 +1632,7 @@ if __name__ == "__main__":
     )
 
     # ========================================================
-    # SAMPLER
+    # STEERING SAMPLING
     # ========================================================
 
     sample_weights, train_counts = (
@@ -1249,6 +1664,10 @@ if __name__ == "__main__":
         dtype=torch.double
     )
 
+    # ========================================================
+    # WEIGHTED SAMPLER
+    # ========================================================
+
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_list),
@@ -1264,7 +1683,9 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         sampler=sampler,
         num_workers=4,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(
+            device.type == "cuda"
+        ),
         drop_last=False
     )
 
@@ -1273,7 +1694,9 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=4,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(
+            device.type == "cuda"
+        ),
         drop_last=False
     )
 
@@ -1281,7 +1704,13 @@ if __name__ == "__main__":
     # MODEL
     # ========================================================
 
-    model = AutonomousDriver().to(device)
+    model = AutonomousDriver().to(
+        device
+    )
+
+    # ========================================================
+    # PARAMETER COUNT
+    # ========================================================
 
     parameter_count = sum(
         p.numel()
@@ -1296,7 +1725,9 @@ if __name__ == "__main__":
 
     print(
         "Fusion input features:",
-        model.fusion_branch[0].in_features
+        model.fusion_branch[
+            0
+        ].in_features
     )
 
     print(
