@@ -2,33 +2,21 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-
-from torch.utils.data import (
-    DataLoader,
-    WeightedRandomSampler
-)
-
-from dataset import (
-    CarlaDataset,
-    build_path_index,
-    get_steering_sampling_weights,
-    summarize_steering_distribution
-)
-
+from torch.utils.data import ( DataLoader, WeightedRandomSampler )
+from dataset import ( CarlaDataset, build_path_index, get_steering_sampling_weights, summarize_steering_distribution)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 NUM_TELEMETRY = 11
-
 BATCH_SIZE = 32
 EPOCHS = 15
 LEARNING_RATE = 2e-5
 VAL_RATIO = 0.15
 SEED = 42
 
-CHECKPOINT = "model_v8.pth"
+CHECKPOINT = "model_v9.pth"
 
 
 # ============================================================
@@ -51,90 +39,25 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.vision_branch = nn.Sequential(
-
-            nn.Conv2d(
-                3,
-                32,
-                kernel_size=5,
-                stride=2,
-                padding=2
-            ),
-
+            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(
-                32,
-                64,
-                kernel_size=5,
-                stride=2,
-                padding=2
-            ),
-
+            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(
-                64,
-                128,
-                kernel_size=5,
-                stride=2,
-                padding=2
-            ),
-
+            nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(
-                128,
-                128,
-                kernel_size=3,
-                stride=1,
-                padding=1
-            ),
-
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(
-                128,
-                128,
-                kernel_size=3,
-                stride=1,
-                padding=1
-            ),
-
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.Conv2d(
-                128,
-                128,
-                kernel_size=3,
-                stride=1,
-                padding=1
-            ),
-
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-
-            nn.AdaptiveAvgPool2d(
-                (10, 10)
-            ),
-
+            nn.AdaptiveAvgPool2d((10, 10)),
             nn.Flatten(),
-
-            nn.Linear(
-                128 * 10 * 10,
-                256
-            ),
-
+            nn.Linear(128 * 10 * 10, 256),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                256,
-                500
-            ),
-
+            nn.Linear(256, 500),
             nn.ReLU(inplace=True),
-
-            nn.Dropout(
-                0.2
-            )
+            nn.Dropout(0.2)
         )
 
         # ====================================================
@@ -154,26 +77,11 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.vehicle_state_branch = nn.Sequential(
-
-            nn.Linear(
-                5,
-                32
-            ),
-
+            nn.Linear(5, 32),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                32,
-                64
-            ),
-
+            nn.Linear(32, 64),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                64,
-                64
-            ),
-
+            nn.Linear(64, 64),
             nn.ReLU(inplace=True)
         )
 
@@ -188,19 +96,9 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.junction_state_branch = nn.Sequential(
-
-            nn.Linear(
-                1,
-                16
-            ),
-
+            nn.Linear(1, 16),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                16,
-                32
-            ),
-
+            nn.Linear(16, 32),
             nn.ReLU(inplace=True)
         )
 
@@ -219,19 +117,13 @@ class AutonomousDriver(nn.Module):
         # 0 is reserved.
         # ====================================================
 
-        self.command_embedding = nn.Embedding(
-            7,
-            32
-        )
+        self.command_embedding = nn.Embedding(7, 32)
 
         # ====================================================
         # NEXT COMMAND
         # ====================================================
 
-        self.next_command_embedding = nn.Embedding(
-            7,
-            32
-        )
+        self.next_command_embedding = nn.Embedding(7, 32)
 
         # ====================================================
         # OBJECT TYPE
@@ -243,10 +135,7 @@ class AutonomousDriver(nn.Module):
         # 4 pedestrian
         # ====================================================
 
-        self.object_type_embedding = nn.Embedding(
-            5,
-            16
-        )
+        self.object_type_embedding = nn.Embedding(5, 16)
 
         # ====================================================
         # OBJECT STATE
@@ -261,19 +150,9 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.object_state_branch = nn.Sequential(
-
-            nn.Linear(
-                18,
-                32
-            ),
-
+            nn.Linear(18, 32),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                32,
-                64
-            ),
-
+            nn.Linear(32, 64),
             nn.ReLU(inplace=True)
         )
 
@@ -291,19 +170,9 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.fusion_branch = nn.Sequential(
-
-            nn.Linear(
-                724,
-                256
-            ),
-
+            nn.Linear(724, 256),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                256,
-                128
-            ),
-
+            nn.Linear(256, 128),
             nn.ReLU(inplace=True)
         )
 
@@ -315,12 +184,7 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.steering_head = nn.Sequential(
-
-            nn.Linear(
-                128,
-                1
-            ),
-
+            nn.Linear(128, 1),
             nn.Tanh()
         )
 
@@ -332,12 +196,7 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         self.throttle_head = nn.Sequential(
-
-            nn.Linear(
-                128,
-                1
-            ),
-
+            nn.Linear(128,1),
             nn.Sigmoid()
         )
 
@@ -352,20 +211,13 @@ class AutonomousDriver(nn.Module):
         # the output as a probability.
         # ====================================================
 
-        self.brake_head = nn.Linear(
-            128,
-            1
-        )
+        self.brake_head = nn.Linear(128,1)
 
     # ========================================================
     # FORWARD
     # ========================================================
 
-    def forward(
-        self,
-        image_input,
-        telemetry_input
-    ):
+    def forward(self,image_input,telemetry_input):
 
         # ====================================================
         # CHECK TELEMETRY
@@ -403,37 +255,27 @@ class AutonomousDriver(nn.Module):
         # ====================================================
 
         speed = telemetry_input[:, 0:1]
-
         command = (
             telemetry_input[:, 1]
             .long()
             .clamp(0, 6)
         )
-
         junction = telemetry_input[:, 2:3]
-
         object_type = (
             telemetry_input[:, 3]
             .long()
             .clamp(0, 4)
         )
-
         object_id = telemetry_input[:, 4:5]
-
         object_distance = telemetry_input[:, 5:6]
-
         speed_limit = telemetry_input[:, 6:7]
-
         angle = telemetry_input[:, 7:8]
-
         next_command = (
             telemetry_input[:, 8]
             .long()
             .clamp(0, 6)
         )
-
         theta = telemetry_input[:, 9:10]
-
         lateral_distance = telemetry_input[:, 10:11]
 
         # ====================================================
@@ -1391,6 +1233,7 @@ if __name__ == "__main__":
         "./PDM_Lite_Carla_LB2_Data/Town01/data/*",
         "./PDM_Lite_Carla_LB2_Data/Town02/data/*",
         "./PDM_Lite_Carla_LB2_Data/Town03/data/*/*",
+        "./PDM_Lite_Carla_LB2_Data/Town04/data/*"
     ]
 
     # ========================================================
