@@ -4,7 +4,6 @@ import math
 import time
 import queue
 import random
-import traceback
 import argparse
 
 import cv2
@@ -24,7 +23,7 @@ PROJECT_DIR = os.path.dirname(
 
 MODEL_FILE = os.path.join(
     PROJECT_DIR,
-    "model_v9.pth"
+    "model_v14.pth"
 )
 
 DRIVELM_ROOT = os.path.expanduser(
@@ -107,9 +106,15 @@ DEVICE = torch.device(
     else "cpu"
 )
 
-MODEL_WIDTH = 400
-MODEL_HEIGHT = 200
-MODEL_TELEMETRY = 11
+MODEL_WIDTH = 480
+MODEL_HEIGHT = 240
+MODEL_TELEMETRY = 8
+
+# Fraction of the top of each camera frame to drop before feeding
+# the model, so inference matches dataset.py.  The dataset crops the
+# top 30% (sky / buildings / trees) during training:
+#     image = image[int(0.3 * image.shape[0]):, :]
+IMAGE_CROP_RATIO = 0.30
 
 
 # ============================================================
@@ -153,8 +158,14 @@ VEHICLE_FILTER = "vehicle.tesla.model3"
 BRAKE_THRESHOLD = 0.50
 MAX_THROTTLE = 0.40
 
-STEER_SMOOTHING = 0.35
-MAX_STEER_STEP = 0.12
+# --- Steering Stability & Smoothness ---
+# Simplified single-stage EMA smoothing.  The previous double-EMA + rate
+# limiter + speed-adaptive sensitivity chain created so much lag that the
+# model's corrections never reached the wheels in time, causing the car
+# to spin in place or drive straight off-route.
+STEER_SMOOTHING = 0.40          # EMA smoothing factor (lower = more responsive)
+MAX_STEER_STEP = 0.15           # Max change per frame (rate limit)
+STEER_DEAD_ZONE = 0.01          # Dead zone around center to prevent jitter
 
 
 # ============================================================
@@ -174,7 +185,25 @@ TOWNS = [
     "Town02",
     "Town03",
     "Town04",
+    "Town05",
+    "Town06",
+    "Town07",
+    "Town10HD",
 ]
+
+# Towns known to be heavy on VRAM or prone to segfaults on <8GB GPUs.
+# Used only for warning messages; the actual probe happens at runtime.
+HEAVY_TOWNS = {
+    "Town03",
+    "Town04",
+    "Town10HD",
+}
+
+# Towns confirmed working for this install (updated by --test-towns).
+CONFIRMED_FILE = os.path.join(
+    PROJECT_DIR,
+    ".confirmed_towns"
+)
 
 
 # ============================================================
@@ -185,6 +214,37 @@ MIN_ROUTE_DISTANCE = 180.0
 MAX_ROUTE_DISTANCE = 1500.0
 DESTINATION_ATTEMPTS = 150
 REQUIRE_TURN = True
+
+# Spawn-validity tolerances.
+#
+# Root cause (seen in the wild): if the random spawn point is far from the
+# drivable road graph, GlobalRoutePlanner snaps the route start a long way
+# from the vehicle (e.g. ~294 m). ensure_route_starts_at_vehicle() then
+# prepends the car's transform, producing a huge first segment that points
+# ~169deg off the car's heading, so the angle input fed to the model says
+# "the route is behind me" and the car just wheels sideways and gets stuck.
+#
+#   SPAWN_ROAD_TOLERANCE : max distance (m) from a candidate spawn point to
+#       the nearest drivable road centerline. Spawn points farther away are
+#       skipped so the ego vehicle always starts near the drivable network.
+#   ROUTE_START_TOLERANCE: max distance (m) allowed between the vehicle and
+#       route[0] (the planner's snapped start). If the planner had to snap
+#       farther than this, the route is rejected (backstop for a non-drivable
+#       spawn). Must exceed the planner node_density (2.0) plus spawn offset.
+SPAWN_ROAD_TOLERANCE = 3.0
+ROUTE_START_TOLERANCE = 5.0
+
+# Max heading error (rad) allowed between the vehicle and the start of a
+# chosen route. If the first real route point lies more than this off the
+# vehicle's heading, the route is rejected outright — otherwise the model
+# is told "the route is behind me" and the car wheels hard to one side and
+# spins in place.
+FORWARD_ANGLE_TOLERANCE = 1.2   # ~69 deg
+
+# Distance (m) from the destination at which the driver brakes and stops.
+# Without this the car never terminates: it keeps driving and, once past the
+# end of the route, chases the final route point (now behind it) in circles.
+DESTINATION_REACHED_DISTANCE = 10.0
 
 
 # ============================================================
@@ -201,20 +261,113 @@ COMMAND_NAMES = {
 }
 
 
+
 # ============================================================
 # IMAGE
+#
+# Single source of truth for what the driver feeds the model.
+# IMAGE_SPEC documents the pipeline; IMAGE_TRANSFORM is built
+# FROM it, so the code and its description cannot drift apart.
+#
+# Pipeline (must match dataset.py CarlaDataset image load path):
+#
+#   [CARLA RGB uint8, 512 x 1024]
+#       -> drop top 30%            (sky / buildings / trees)
+#       -> grayscale (luminance)
+#       -> resize to 480 x 240     (H, W)
+#       -> ToTensor -> float32 tensor (1, 240, 480), values in [0, 1]
+#       -> NO mean/std normalization (same as dataset.py)
 # ============================================================
+
+IMAGE_SPEC = {
+    # --- input ---
+    "input": {
+        "channels": "RGB",
+        "dtype": "uint8",
+        "range": [0, 255],
+        "height": CAMERA_HEIGHT,
+        "width": CAMERA_WIDTH,
+    },
+    # --- crop ---
+    "crop": {
+        "ratio": IMAGE_CROP_RATIO,
+        "px": int(
+            IMAGE_CROP_RATIO * CAMERA_HEIGHT
+        ),
+        "note": (
+            "top of the frame is removed before resize, "
+            "exactly like dataset.py"
+        ),
+    },
+    # --- grayscale ---
+    "grayscale": True,
+    "grayscale_formula": (
+        "luminance: 0.299 R + 0.587 G + 0.114 B"
+    ),
+    # --- resize ---
+    "resize": (MODEL_HEIGHT, MODEL_WIDTH),   # (H, W)
+    "resize_interpolation": (
+        "BILINEAR (torchvision Resize default)"
+    ),
+    # --- output tensor ---
+    "output": {
+        "channels": 1,
+        "shape": (1, MODEL_HEIGHT, MODEL_WIDTH),
+        "dtype": "float32",
+        "range": [0.0, 1.0],
+        "normalization": "none (raw [0,1])",
+    },
+    # --- reference statistics ---
+    "note": (
+        "IMG_MEAN / IMG_STD computed over the training set "
+        "(0.4020 / 0.1886) are NOT applied here.  Applying them "
+        "without matching dataset.py would desync inference from "
+        "training."
+    ),
+}
+
 
 IMAGE_TRANSFORM = transforms.Compose([
     transforms.ToPILImage(),
+    transforms.Grayscale(),
     transforms.Resize(
-        (
-            MODEL_HEIGHT,
-            MODEL_WIDTH
-        )
+        IMAGE_SPEC["resize"]
     ),
     transforms.ToTensor(),
 ])
+
+
+def report_image_spec(title="DRIVER INFERENCE IMAGE SPEC"):
+
+    """
+    Print the exact image format the driver produces, so it can
+    be compared against the dataset load path without reading
+    either implementation.
+    """
+
+    print()
+    print(title)
+    print("-" * 70)
+
+    for key, value in IMAGE_SPEC.items():
+
+        if isinstance(value, dict):
+
+            print(f"{key}:")
+
+            for sub_key, sub_value in value.items():
+
+                print(
+                    f"    {sub_key:<20}: {sub_value}"
+                )
+
+        else:
+
+            print(
+                f"{key:<20}: {value}"
+            )
+
+    print("-" * 70)
 
 
 # ============================================================
@@ -230,6 +383,7 @@ imu_queue = queue.Queue()
 # ============================================================
 
 _last_steering = 0.0
+_last_steering_smoothed = 0.0
 
 
 # ============================================================
@@ -340,14 +494,11 @@ def get_sensor_frame_data(
         if data.frame < frame:
             continue
 
-        if data.frame == frame:
-            return data
-
-        raise RuntimeError(
-            f"Sensor frame mismatch: "
-            f"wanted {frame}, "
-            f"got {data.frame}."
-        )
+        # If a newer frame has already arrived (we fell behind — a slow
+        # inference frame, a missed tick, a rendering stall), skip ahead
+        # to it rather than crash the whole driver.  Camera and IMU are
+        # polled for the same tick, so they stay roughly aligned.
+        return data
 
 
 # ============================================================
@@ -984,6 +1135,65 @@ def choose_destination(
 
 
 # ============================================================
+# ROUTE INITIALIZATION
+# ============================================================
+
+def ensure_route_starts_at_vehicle(vehicle, route):
+    """
+    Ensure the route starts at the vehicle's current location.
+    The GlobalRoutePlanner returns a route from the road network,
+    which may not start exactly at the vehicle's position.
+
+    If the first route point is only a short hop away we prepend the
+    vehicle transform (a small offset is fine — that segment then points
+    roughly forward). If the first route point is far away, the planner
+    snapped the start to a distant node; prepending would create a giant
+    phantom segment pointing behind the car and make the model chase it.
+    Instead we trim the leading points up to the nearest point that lies
+    ahead of the vehicle, then prepend a clean short segment.
+    """
+    if not route or len(route) < 2:
+        return route
+
+    vehicle_transform = vehicle.get_transform()
+    first_wp_transform = route[0][0]
+
+    # Distance from vehicle to first route point
+    dist = vehicle_transform.location.distance(first_wp_transform.location)
+
+    # Small offset: prepend the vehicle position (LANEFOLLOW first segment).
+    if dist <= ROUTE_START_TOLERANCE:
+        if dist > 2.0:
+            print(f"  Route starts {dist:.1f}m from vehicle, prepending vehicle transform")
+            return [(vehicle_transform, RoadOption.LANEFOLLOW)] + route
+        return route
+
+    # Large offset: trim the leading points up to the nearest forward point.
+    print(f"  Route starts {dist:.1f}m from vehicle; trimming leading points")
+
+    best_index = None
+    best_forward_x = float("inf")
+
+    for i in range(1, len(route)):
+        lx, ly = world_to_ego_xy(
+            vehicle,
+            route[i][0].location.x,
+            route[i][0].location.y
+        )
+        if lx <= 0.0:
+            continue
+        if lx < best_forward_x:
+            best_forward_x = lx
+            best_index = i
+
+    if best_index is not None:
+        trimmed = route[best_index:]
+        return [(vehicle_transform, RoadOption.LANEFOLLOW)] + trimmed
+
+    return route
+
+
+# ============================================================
 # DIRECT CARLA ROUTE STATE
 # ============================================================
 
@@ -1099,9 +1309,13 @@ class CarlaRouteState:
         best_index = 0
         best_t = 0.0
 
-        # Search whole route.
-        # This is safer than assuming the planner's index
-        # is always synchronized.
+        # Scan the ENTIRE route for the true nearest segment.  Searching
+        # only a forward window made nearest_index monotonic: after a
+        # collision, a lane swap, or a loop (roundabout) the vehicle could
+        # never re-find the correct segment and locked onto a far-ahead one,
+        # producing a wrong angle and wrong commands.  The prepended
+        # vehicle-position segment is short and never wins, so it cannot
+        # trap the search.
         for i in range(
             len(route) - 1
         ):
@@ -1215,9 +1429,197 @@ class CarlaRouteState:
             )
         )
 
+    # --------------------------------------------------------
+    # TARGET POINT (for angle) — speed-scaled lookahead matching
+    # the PDM-Lite data collector (`autopilot.py` `_get_steer`).
+    #
+    # The collector computes the lookahead in route points:
+    #
+    #     lookahead_pts = 0.9755321901954155 * speed_kmph
+    #                     + 1.9152884533402488
+    #     lookahead_pts = clip(lookahead_pts, 2.4*ppm, 10.5*ppm)
+    #
+    # with points_per_meter (ppm) = 10, i.e. in meters:
+    #
+    #     clip(0.09755 * speed_kmph + 0.19, 2.4, 10.5)
+    # --------------------------------------------------------
+
+    def get_angle_lookahead(self):
+
+        speed_kmh = (
+            get_speed_ms(
+                self.vehicle
+            )
+            *
+            3.6
+        )
+
+        points_per_meter = 10.0
+
+        lookahead_pts = (
+            0.9755321901954155 * speed_kmh
+            +
+            1.9152884533402488
+        )
+
+        lookahead_pts = float(
+            np.clip(
+                lookahead_pts,
+                2.4 * points_per_meter,
+                10.5 * points_per_meter
+            )
+        )
+
+        return lookahead_pts / points_per_meter
+
+    def get_target_point(self):
+
+        route = self.route_points
+
+        if len(route) < 2:
+
+            return None
+
+        (
+            nearest_index,
+            nearest_t
+        ) = (
+            self.find_nearest_segment()
+        )
+
+        p1 = route[
+            nearest_index,
+            :2
+        ]
+
+        p2 = route[
+            nearest_index + 1,
+            :2
+        ]
+
+        segment = (
+            p2 - p1
+        )
+
+        segment_length = float(
+            np.linalg.norm(
+                segment
+            )
+        )
+
+        if segment_length <= 1e-9:
+
+            return route[
+                nearest_index + 1
+            ].copy()
+
+        remaining_on_segment = (
+            segment_length
+            *
+            (
+                1.0
+                -
+                nearest_t
+            )
+        )
+
+        lookahead = self.get_angle_lookahead()
+
+        if lookahead <= remaining_on_segment:
+
+            ratio = (
+                nearest_t
+                +
+                lookahead
+                /
+                segment_length
+            )
+
+            target = (
+                p1
+                +
+                ratio * segment
+            )
+
+            return np.array(
+                [
+                    target[0],
+                    target[1],
+                    route[
+                        nearest_index,
+                        2
+                    ]
+                ],
+                dtype=np.float64
+            )
+
+        remaining = (
+            lookahead
+            -
+            remaining_on_segment
+        )
+
+        for i in range(
+            nearest_index + 1,
+            len(route) - 1
+        ):
+
+            a = route[
+                i,
+                :2
+            ]
+
+            b = route[
+                i + 1,
+                :2
+            ]
+
+            segment = (
+                b - a
+            )
+
+            segment_length = float(
+                np.linalg.norm(
+                    segment
+                )
+            )
+
+            if segment_length <= 1e-9:
+                continue
+
+            if remaining <= segment_length:
+
+                ratio = (
+                    remaining
+                    /
+                    segment_length
+                )
+
+                target = (
+                    a
+                    +
+                    ratio * segment
+                )
+
+                return np.array(
+                    [
+                        target[0],
+                        target[1],
+                        route[
+                            i,
+                            2
+                        ]
+                    ],
+                    dtype=np.float64
+                )
+
+            remaining -= segment_length
+
+        return route[-1].copy()
+
 
     # ========================================================
-    # AIM POINT
+    # AIM POINT (for lateral/steering) — shorter 4-12m lookahead
     # ========================================================
 
     def get_aim_point(self):
@@ -1374,19 +1776,19 @@ class CarlaRouteState:
 
     def calculate_angle(self):
 
-        self.aim_point = (
-            self.get_aim_point()
-        )
+        # Use the collector's speed-scaled target point (2.4-10.5m)
+        # for angle to match the PDM-Lite data collector's stored angle.
+        target_point = self.get_target_point()
 
-        if self.aim_point is None:
+        if target_point is None:
 
             return 0.0
 
         local_x, local_y = (
             world_to_ego_xy(
                 self.vehicle,
-                self.aim_point[0],
-                self.aim_point[1]
+                target_point[0],
+                target_point[1]
             )
         )
 
@@ -1433,7 +1835,7 @@ class CarlaRouteState:
 
             if best is not None:
 
-                self.aim_point = best
+                target_point = best
 
                 local_x, local_y = (
                     world_to_ego_xy(
@@ -1480,32 +1882,39 @@ class CarlaRouteState:
             dtype=np.float64
         )
 
-        (
-            nearest_index,
-            _
-        ) = (
-            self.find_nearest_segment()
-        )
+        # ----------------------------------------------------
+        # Same convention as dataset.py
+        # (CarlaDataset.calculate_lateral_distance), so training
+        # and inference compute the input identically.
+        #
+        # Iterate ALL route segments and pick the segment whose
+        # SUPPORTING LINE is nearest, measuring the SIGNED
+        # perpendicular distance from the ego to that line in
+        # the route's right-normal direction:
+        #
+        #     right  = (-ty, tx)
+        #     lateral = (ego - p1) . right
+        #
+        # Positive -> ego RIGHT of route.
+        # Negative -> ego LEFT of route.
+        #
+        # NOTE: like dataset.py, we DO NOT clamp the projection
+        # onto the segment (no t in [0, 1]) and we select by the
+        # minimum absolute perpendicular distance to the
+        # supporting line -- NOT by distance to the nearest
+        # on-segment point and NOT within a window.
+        # ----------------------------------------------------
 
-        start = max(
-            0,
-            nearest_index - 5
-        )
+        eps = 1e-9
 
-        end = min(
-            len(route) - 1,
-            nearest_index + 10
-        )
-
-        best_distance_sq = float(
+        best_abs = float(
             "inf"
         )
 
         best_lateral = 0.0
 
         for i in range(
-            start,
-            end
+            len(route) - 1
         ):
 
             p1 = route[
@@ -1529,44 +1938,9 @@ class CarlaRouteState:
                 )
             )
 
-            if length_sq <= 1e-9:
+            # Ignore duplicate / invalid points.
+            if length_sq <= eps:
                 continue
-
-            t = float(
-                np.dot(
-                    ego - p1,
-                    segment
-                )
-                /
-                length_sq
-            )
-
-            t = float(
-                np.clip(
-                    t,
-                    0.0,
-                    1.0
-                )
-            )
-
-            closest = (
-                p1
-                +
-                t * segment
-            )
-
-            delta = (
-                ego
-                -
-                closest
-            )
-
-            distance_sq = float(
-                np.dot(
-                    delta,
-                    delta
-                )
-            )
 
             length = math.sqrt(
                 length_sq
@@ -1589,20 +1963,15 @@ class CarlaRouteState:
             right_y = tx
 
             lateral = (
-                delta[0] * right_x
+                (ego[0] - p1[0]) * right_x
                 +
-                delta[1] * right_y
+                (ego[1] - p1[1]) * right_y
             )
 
-            if distance_sq < best_distance_sq:
+            if abs(lateral) < best_abs:
 
-                best_distance_sq = (
-                    distance_sq
-                )
-
-                best_lateral = (
-                    lateral
-                )
+                best_abs = abs(lateral)
+                best_lateral = lateral
 
         return float(
             best_lateral
@@ -1728,21 +2097,12 @@ class CarlaRouteState:
 
 
 # ============================================================
-# OBJECT INPUT
-# ============================================================
-
-def get_speed_reduction_object():
-
-    return (
-        0,
-        -1,
-        0.0
-    )
-
-
-# ============================================================
 # TELEMETRY
 # ============================================================
+
+# Toggle: True = use direct CARLA state (like measurement files), False = use CarlaRouteState
+USE_DIRECT_TELEMETRY = True
+
 
 def build_model_telemetry(
     vehicle,
@@ -1750,185 +2110,112 @@ def build_model_telemetry(
     route_state,
     theta
 ):
+    """
+    Build 8-dim telemetry for the model.
 
-    speed_raw = (
-        get_speed_ms(
-            vehicle
-        )
+    Uses CarlaRouteState's precomputed angle/lateral for consistency with training data.
+    The dataset stores angle and lateral computed by the data collector using the same
+    route lookahead logic as CarlaRouteState.
+    """
+
+    speed_raw = safe_float(
+        get_speed_ms(vehicle),
+        "vehicle speed",
+        0.0
     )
 
+    # Speed limit from CARLA
     speed_limit_raw = safe_float(
-        route_state.speed_limit,
-        "speed limit",
-        fallback=(
-            get_carla_speed_limit_ms(
-                vehicle
-            )
-        )
+        get_carla_speed_limit_ms(vehicle),
+        "CARLA speed limit",
+        50.0 / 3.6
     )
 
-    angle_raw = safe_float(
-        route_state.angle_raw,
-        "route angle"
+    # Junction from current waypoint
+    waypoint = world.get_map().get_waypoint(
+        vehicle.get_location(),
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving
     )
+    junction = float(bool(waypoint.is_junction)) if waypoint is not None else 0.0
 
-    lateral_raw = safe_float(
-        route_state.lateral_raw,
-        "lateral distance"
-    )
+    # Command from route_state (uses route decisions)
+    command = float(route_state.command)
+    next_command = float(route_state.next_command)
 
-    waypoint = (
-        world
-        .get_map()
-        .get_waypoint(
-            vehicle.get_location(),
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving
-        )
-    )
+    # Angle: use precomputed value from route_state (target_point via
+    # the collector's speed-scaled 2.4-10.5m lookahead)
+    # This matches how the data collector computes 'angle' in measurements
+    angle_raw = safe_float(route_state.angle_raw, "route angle", 0.0)
 
-    junction = (
-        float(
-            bool(
-                waypoint.is_junction
-            )
-        )
-        if waypoint is not None
-        else 0.0
-    )
+    # Lateral distance: use precomputed value from route_state
+    # This matches how the data collector computes 'lateral' in measurements
+    lateral_raw = safe_float(route_state.lateral_raw, "lateral distance", 0.0)
 
-    (
-        object_type,
-        object_id,
-        object_distance_raw
-    ) = get_speed_reduction_object()
+    # ----------------------------------------------------
+    # NORMALIZATION (must match dataset.py exactly)
+    # ----------------------------------------------------
 
     telemetry = np.array(
         [
+            # 0 speed: clipped to [0, 2] with 30 m/s reference
+            np.clip(speed_raw / 30.0, 0.0, 2.0),
 
-            # 0 speed
-            np.clip(
-                speed_raw / 30.0,
-                0.0,
-                2.0
-            ),
+            # 1 command: 1-6 (LEFT, RIGHT, STRAIGHT, LANEFOLLOW, CHANGE_LANE_L/R)
+            command,
 
-            # 1 command
-            float(
-                route_state.command
-            ),
-
-            # 2 junction
+            # 2 junction: 0.0 or 1.0
             junction,
 
-            # 3 object type
-            float(
-                object_type
-            ),
+            # 3 speed_limit: clipped to [0, 2] with 30 m/s reference
+            np.clip(speed_limit_raw / 30.0, 0.0, 2.0),
 
-            # 4 object id
-            float(
-                object_id
-            ),
+            # 4 angle: MUST match dataset.py exactly.
+            # dataset.py reads the raw angle from the measurement file
+            # (in radians) and normalizes it as:
+            #     np.clip(angle / np.pi, -1.0, 1.0)
+            # angle_raw from route_state is already in radians, so apply
+            # the same normalization at inference:
+            np.clip(angle_raw / math.pi, -1.0, 1.0),
 
-            # 5 object distance
-            np.clip(
-                object_distance_raw / 50.0,
-                0.0,
-                1.0
-            ),
+            # 5 next_command: 1-6
+            next_command,
 
-            # 6 speed limit
-            np.clip(
-                speed_limit_raw / 30.0,
-                0.0,
-                2.0
-            ),
+            # 6 theta: clipped to [-1, 1] with pi reference
+            np.clip(theta / math.pi, -1.0, 1.0),
 
-            # 7 angle
-            np.clip(
-                angle_raw / math.pi,
-                -1.0,
-                1.0
-            ),
-
-            # 8 next command
-            float(
-                route_state.next_command
-            ),
-
-            # 9 theta
-            np.clip(
-                theta / math.pi,
-                -1.0,
-                1.0
-            ),
-
-            # 10 lateral
-            np.clip(
-                lateral_raw / 2.0,
-                -1.0,
-                1.0
-            ),
+            # 7 lateral_distance: clipped to [-1, 1] with 2m reference
+            np.clip(lateral_raw / 2.0, -1.0, 1.0),
         ],
         dtype=np.float32
     )
 
-    if telemetry.shape != (11,):
+    if telemetry.shape != (8,):
+        raise RuntimeError(f"Telemetry shape mismatch: {telemetry.shape}")
 
-        raise RuntimeError(
-            f"Telemetry shape mismatch: "
-            f"{telemetry.shape}"
-        )
-
-    if not np.all(
-        np.isfinite(
-            telemetry
-        )
-    ):
-
-        raise RuntimeError(
-            "Telemetry contains NaN/Inf."
-        )
+    if not np.all(np.isfinite(telemetry)):
+        raise RuntimeError("Telemetry contains NaN/Inf.")
 
     raw = {
-        "speed":
-            speed_raw,
-
-        "speed_limit":
-            speed_limit_raw,
-
-        "angle":
-            angle_raw,
-
-        "theta":
-            theta,
-
-        "lateral":
-            lateral_raw,
-
-        "vehicle_location":
-            [
-                vehicle.get_location().x,
-                vehicle.get_location().y,
-                vehicle.get_location().z
-            ],
-
-        "vehicle_yaw":
-            vehicle.get_transform().rotation.yaw,
-
-        "aim_wp":
-            (
-                None
-                if route_state.aim_point is None
-                else route_state.aim_point.copy()
-            ),
+        "speed": speed_raw,
+        "speed_limit": speed_limit_raw,
+        "angle": angle_raw,
+        "theta": theta,
+        "lateral": lateral_raw,
+        "vehicle_location": [
+            vehicle.get_location().x,
+            vehicle.get_location().y,
+            vehicle.get_location().z
+        ],
+        "vehicle_yaw": vehicle.get_transform().rotation.yaw,
+        "aim_wp": (
+            None
+            if route_state.aim_point is None
+            else route_state.aim_point.copy()
+        ),
     }
 
-    return (
-        telemetry,
-        raw
-    )
+    return telemetry, raw
 
 
 # ============================================================
@@ -2041,6 +2328,15 @@ def run_model(
     telemetry
 ):
 
+    # Crop the top 30% (sky / buildings / trees) to match the
+    # dataset's preprocessing, so the model sees the same road-only
+    # view at inference as it was trained on.
+    crop_h = int(
+        rgb.shape[0]
+        * IMAGE_CROP_RATIO
+    )
+    rgb = rgb[crop_h:, :]
+
     image_tensor = (
         IMAGE_TRANSFORM(
             rgb
@@ -2065,22 +2361,18 @@ def run_model(
         )
     )
 
-    output = model(
+    # model returns a tuple:
+    #   steering    : [B, 1]  (Tanh    -> [-1, 1])
+    #   throttle    : [B, 1]  (Sigmoid -> [ 0, 1])
+    #   brake_logits: [B, 2]  (2-class classification logits)
+    steering, throttle, brake_logits = model(
         image_tensor,
         telemetry_tensor
     )
 
-    if output.shape != (1, 3):
-
-        raise RuntimeError(
-            f"Model output shape "
-            f"{output.shape}; "
-            f"expected (1,3)."
-        )
-
     steering = float(
         np.clip(
-            output[0, 0].item(),
+            steering.item(),
             -1.0,
             1.0
         )
@@ -2088,28 +2380,20 @@ def run_model(
 
     throttle = float(
         np.clip(
-            output[0, 1].item(),
+            throttle.item(),
             0.0,
             MAX_THROTTLE
         )
     )
 
-    brake_logit = float(
-        output[0, 2].item()
-    )
-
-    brake_probability = float(
-        torch
-        .sigmoid(
-            output[0, 2]
-        )
-        .item()
-    )
+    # Brake head is broken (outputs 0.99 for all inputs) due to
+    # overfitting — plain Linear layers with no activations/norm.
+    # Disabled: car uses only steering + throttle from the model.
+    brake_probability = 0.0
 
     return (
         steering,
         throttle,
-        brake_logit,
         brake_probability
     )
 
@@ -2125,73 +2409,74 @@ def apply_control(
     brake_probability
 ):
 
-    global _last_steering
+    global _last_steering, _last_steering_smoothed
 
-    steering = float(
-        np.clip(
-            steering,
-            -1.0,
-            1.0
-        )
-    )
+    speed_ms = get_speed_ms(vehicle)
+    speed_kmh = speed_ms * 3.6
 
+    # --- Throttle ---
+    # Cruise-control boost.  The model's throttle head collapses toward
+    # zero on real camera frames (probe of model_v14: throttle ~0.0003 on
+    # non-blank images), so relying on it leaves the car stranded.  Boost
+    # throttle whenever we are below the road speed limit; the model's
+    # request wins when it asks for more.
+    #
+    # A straight proportional curve is too shallow: at low speed it
+    # equalizes against drag and the car settles into a ~2 m/s creep.
+    # Use broad steps so the car actually accelerates up to the limit:
+    #
+    #   >=6 m/s below limit  -> 0.40  (hard pull off the line)
+    #   3-6 m/s below limit  -> 0.32
+    #   1.5-3 m/s below      -> 0.24  (still accelerating)
+    #   <1.5 m/s below       -> 0.00  (at cruise; model takes over)
+    speed_limit_ms = get_carla_speed_limit_ms(vehicle)
+    speed_deficit = max(0.0, speed_limit_ms - speed_ms)
+    if speed_deficit >= 6.0:
+        throttle_boost = 0.40
+    elif speed_deficit >= 3.0:
+        throttle_boost = 0.32
+    elif speed_deficit >= 1.5:
+        throttle_boost = 0.24
+    else:
+        throttle_boost = 0.0
     throttle = float(
         np.clip(
-            throttle,
+            max(throttle, throttle_boost),
             0.0,
             MAX_THROTTLE
         )
     )
 
-    delta = (
-        steering
-        -
-        _last_steering
-    )
+    # --- Steering: single EMA smoothing ---
+    # At very low speed (standstill / just started), use less smoothing so
+    # the car can actually begin turning.  At higher speed, smooth more to
+    # avoid oscillation.
+    if speed_kmh < 5.0:
+        alpha = 0.25   # fast response at low speed
+    elif speed_kmh < 20.0:
+        alpha = 0.35   # moderate
+    else:
+        alpha = STEER_SMOOTHING  # smooth at cruising speed
 
-    delta = float(
-        np.clip(
-            delta,
-            -MAX_STEER_STEP,
-            MAX_STEER_STEP
-        )
-    )
+    steering_applied = float(np.clip(
+        alpha * steering + (1.0 - alpha) * _last_steering_smoothed,
+        -1.0,
+        1.0,
+    ))
 
-    limited = (
-        _last_steering
-        +
-        delta
-    )
+    _last_steering = steering
+    _last_steering_smoothed = steering_applied
 
-    steering_applied = (
-        STEER_SMOOTHING
-        * limited
-        +
-        (
-            1.0
-            -
-            STEER_SMOOTHING
-        )
-        *
-        _last_steering
-    )
+    # --- Brake ---
+    # At very low speeds, require higher brake probability to brake.
+    if speed_kmh < 3.0:
+        effective_brake_threshold = BRAKE_THRESHOLD + 0.3
+    elif speed_kmh < 10.0:
+        effective_brake_threshold = BRAKE_THRESHOLD + 0.15
+    else:
+        effective_brake_threshold = BRAKE_THRESHOLD
 
-    steering_applied = float(
-        np.clip(
-            steering_applied,
-            -1.0,
-            1.0
-        )
-    )
-
-    _last_steering = (
-        steering_applied
-    )
-
-    brake = (
-        brake_probability
-        >= BRAKE_THRESHOLD
-    )
+    brake = brake_probability >= effective_brake_threshold
 
     if brake:
         throttle = 0.0
@@ -2199,25 +2484,15 @@ def apply_control(
     control = carla.VehicleControl(
         steer=steering_applied,
         throttle=throttle,
-        brake=(
-            1.0
-            if brake
-            else 0.0
-        ),
+        brake=(1.0 if brake else 0.0),
         hand_brake=False,
         reverse=False,
         manual_gear_shift=False
     )
 
-    vehicle.apply_control(
-        control
-    )
+    vehicle.apply_control(control)
 
-    return (
-        control.steer,
-        control.throttle,
-        control.brake
-    )
+    return (control.steer, control.throttle, control.brake)
 
 
 # ============================================================
@@ -2252,8 +2527,8 @@ def show_camera(
 
         (
             f"Next: "
-            f"{int(telemetry[8])} "
-            f"{command_name(telemetry[8])}"
+            f"{int(telemetry[5])} "
+            f"{command_name(telemetry[5])}"
         ),
 
         (
@@ -2335,10 +2610,14 @@ def show_camera(
         4
     )
 
-    cv2.imshow(
-        "PDM-Lite Neural Driver - Camera",
-        frame
-    )
+    try:
+        cv2.imshow(
+            "PDM-Lite Neural Driver - Camera",
+            frame
+        )
+    except cv2.error:
+        # Headless / no-display environment: don't crash the driver.
+        pass
 
 
 # ============================================================
@@ -2353,7 +2632,6 @@ def print_debug(
     theta,
     steering,
     throttle,
-    brake_logit,
     brake_probability
 ):
 
@@ -2365,7 +2643,7 @@ def print_debug(
     print("=" * 82)
 
     print(
-        "                 PDM-LITE NEURAL DRIVER V9"
+        "                 PDM-LITE NEURAL DRIVER V14"
     )
 
     print("=" * 82)
@@ -2428,16 +2706,13 @@ def print_debug(
     print("-" * 82)
 
     print(
-        "MODEL INPUT — 11 TELEMETRY"
+        "MODEL INPUT — 8 TELEMETRY"
     )
 
     labels = [
         "speed",
         "command",
         "junction",
-        "object_type",
-        "object_id",
-        "object_distance",
         "speed_limit",
         "angle",
         "next_command",
@@ -2449,7 +2724,7 @@ def print_debug(
 
         if i in (
             1,
-            8
+            5
         ):
 
             print(
@@ -2482,11 +2757,6 @@ def print_debug(
     )
 
     print(
-        f"Brake logit      : "
-        f"{brake_logit:+.6f}"
-    )
-
-    print(
         f"Brake probability: "
         f"{brake_probability:+.6f}"
     )
@@ -2495,15 +2765,392 @@ def print_debug(
 
 
 # ============================================================
+# TOWN PROBE
+# ============================================================
+
+def test_towns(client, towns=None):
+    """
+    Probe each town by loading it and immediately unloading.
+    Returns (working, failed) lists so --test-towns can show
+    which maps are safe to use.
+    """
+    if towns is None:
+        towns = TOWNS
+
+    working = []
+    failed = []
+
+    print()
+    print("=" * 82)
+    print("PROBING TOWNS")
+    print("=" * 82)
+
+    for town in towns:
+        print(f"  Testing {town}...", end=" ", flush=True)
+        try:
+            # Load the town (CARLA handles the heavy lifting).
+            client.load_world(town)
+            # Give the engine a moment to crash if it will.
+            time.sleep(1.0)
+            # If we got here, mark it working.
+            working.append(town)
+            print("OK")
+        except Exception as exc:
+            failed.append((town, str(exc)))
+            print(f"FAILED ({exc})")
+
+    print()
+    print("=" * 82)
+    print("RESULTS")
+    print("=" * 82)
+
+    if working:
+        print(f"  Working : {working}")
+
+    if failed:
+        print(f"  Failed  : {[t for t, _ in failed]}")
+
+    # Persist confirmed towns so the next run can skip known-bad ones.
+    try:
+        with open(CONFIRMED_FILE, "w") as fh:
+            for t in working:
+                fh.write(t + "\n")
+    except Exception:
+        pass
+
+    return working, failed
+
+
+# ============================================================
+# ROUTE RUNNER
+# ============================================================
+
+def run_single_route(
+    client,
+    town,
+    model,
+    route_index=0,
+    num_routes=1,
+):
+    """
+    Drive one complete route in the given town.
+    Returns True if the destination was reached, False otherwise.
+    """
+    world = None
+    vehicle = None
+    camera = None
+    imu = None
+    original_settings = None
+
+    try:
+        world = load_navigation_town(client, town)
+
+        # Sync
+        original_settings = world.get_settings()
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
+        settings.no_rendering_mode = False
+        world.apply_settings(settings)
+
+        os.chdir(PDM_ROOT)
+
+        vehicle = spawn_vehicle(world)
+
+        destination, global_route = choose_destination(
+            world, vehicle
+        )
+
+        # Anchor on the road
+        route_start_tf = global_route[0][0]
+        road_wp = world.get_map().get_waypoint(
+            route_start_tf.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+
+        if road_wp is not None:
+            settle_tf = road_wp.transform
+            settle_tf.location.z += 0.30
+            vehicle.set_transform(settle_tf)
+            vehicle.set_target_velocity(
+                carla.Vector3D(x=0.0, y=0.0, z=0.0)
+            )
+            vehicle.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0, steer=0.0, brake=1.0
+                )
+            )
+            for _ in range(20):
+                world.tick()
+            print("Anchored vehicle to route start.")
+
+        print()
+        print(f"--- Route {route_index + 1}/{num_routes} in {town} ---")
+        print(f"  Destination : {destination.location}")
+        print(f"  Route points: {len(global_route)}")
+        print(
+            "  Decisions   :",
+            route_turn_summary(global_route) or ["STRAIGHT"],
+        )
+
+        # Camera
+        library = world.get_blueprint_library()
+
+        camera_bp = library.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", str(CAMERA_WIDTH))
+        camera_bp.set_attribute("image_size_y", str(CAMERA_HEIGHT))
+        camera_bp.set_attribute("fov", str(CAMERA_FOV))
+        camera_bp.set_attribute(
+            "sensor_tick", str(FIXED_DELTA_SECONDS)
+        )
+
+        camera = world.spawn_actor(
+            camera_bp,
+            carla.Transform(
+                carla.Location(x=CAMERA_X, y=CAMERA_Y, z=CAMERA_Z),
+                carla.Rotation(
+                    roll=CAMERA_ROLL,
+                    pitch=CAMERA_PITCH,
+                    yaw=CAMERA_YAW,
+                ),
+            ),
+            attach_to=vehicle,
+        )
+        camera.listen(camera_callback)
+
+        # IMU
+        imu_bp = library.find("sensor.other.imu")
+        imu_bp.set_attribute(
+            "sensor_tick", str(IMU_SENSOR_TICK)
+        )
+
+        imu = world.spawn_actor(
+            imu_bp,
+            carla.Transform(
+                carla.Location(x=0.0, y=0.0, z=0.0)
+            ),
+            attach_to=vehicle,
+        )
+        imu.listen(imu_callback)
+
+        # Warm-up
+        WARMUP_SECONDS = 5.0
+        WARMUP_TICKS = int(WARMUP_SECONDS / FIXED_DELTA_SECONDS)
+
+        print(
+            f"Warming up sensors for "
+            f"{WARMUP_SECONDS:.0f}s..."
+        )
+
+        for _ in range(WARMUP_TICKS):
+            world.tick()
+            vehicle.apply_control(
+                carla.VehicleControl(
+                    throttle=0.0, steer=0.0, brake=1.0
+                )
+            )
+            while not camera_queue.empty():
+                camera_queue.get_nowait()
+            while not imu_queue.empty():
+                imu_queue.get_nowait()
+
+        print("Warm-up complete.")
+
+        # Prime sensors
+        frame = world.tick()
+        get_sensor_frame_data(camera_queue, frame)
+        get_sensor_frame_data(imu_queue, frame)
+
+        # Ensure route starts at vehicle
+        global_route = ensure_route_starts_at_vehicle(
+            vehicle, global_route
+        )
+
+        route_state = CarlaRouteState(
+            world, vehicle, global_route
+        )
+
+        vehicle.apply_control(
+            carla.VehicleControl(
+                throttle=0.0, steer=0.0, brake=1.0
+            )
+        )
+        world.tick()
+
+        # ---- DRIVING LOOP ----
+        print()
+        print("=" * 82)
+        print(
+            f"DRIVING  —  Route {route_index + 1}/{num_routes}"
+            f"  Town {town}"
+        )
+        print("=" * 82)
+        print("Press Q to stop.")
+        print("Destination:", destination.location)
+
+        while True:
+            frame = world.tick()
+
+            camera_data = get_sensor_frame_data(
+                camera_queue, frame
+            )
+            imu_data = get_sensor_frame_data(
+                imu_queue, frame
+            )
+
+            rgb = image_to_rgb(camera_data)
+
+            compass, theta = get_pdm_theta(imu_data)
+
+            route_state.update()
+
+            # Destination reached?
+            dist_to_dest = vehicle.get_location().distance(
+                destination.location
+            )
+
+            if dist_to_dest < DESTINATION_REACHED_DISTANCE:
+                vehicle.apply_control(
+                    carla.VehicleControl(
+                        throttle=0.0, steer=0.0, brake=1.0
+                    )
+                )
+                print()
+                print("Destination reached!")
+                return True
+
+            telemetry, raw = build_model_telemetry(
+                vehicle, world, route_state, theta
+            )
+
+            # Sanity checks
+            if not (-1.0 <= float(telemetry[4]) <= 1.0):
+                raise RuntimeError(
+                    f"Angle outside range: {telemetry[4]}"
+                )
+            if not (-1.0 <= float(telemetry[6]) <= 1.0):
+                raise RuntimeError(
+                    f"Theta outside range: {telemetry[6]}"
+                )
+            if not (-1.0 <= float(telemetry[7]) <= 1.0):
+                raise RuntimeError(
+                    f"Lateral outside range: {telemetry[7]}"
+                )
+            if not np.all(np.isfinite(telemetry)):
+                raise RuntimeError(
+                    "Telemetry contains NaN/Inf."
+                )
+
+            steering, throttle, brake_p = run_model(
+                model, rgb, telemetry
+            )
+
+            applied_steer, applied_throttle, applied_brake = (
+                apply_control(vehicle, steering, throttle, brake_p)
+            )
+
+            if PRINT_TELEMETRY:
+                print_debug(
+                    telemetry,
+                    raw,
+                    vehicle,
+                    compass,
+                    theta,
+                    applied_steer,
+                    applied_throttle,
+                    brake_p,
+                )
+
+            show_camera(
+                rgb,
+                telemetry,
+                raw,
+                applied_steer,
+                applied_throttle,
+                brake_p,
+            )
+
+            if SHOW_CAMERA:
+                try:
+                    key = cv2.waitKey(1) & 0xFF
+                except cv2.error:
+                    key = -1
+
+                if key == ord("q"):
+                    print("\nQ pressed.")
+                    return False
+
+            if PRINT_TELEMETRY:
+                print(
+                    f"Distance to destination: "
+                    f"{dist_to_dest:.2f} m"
+                )
+
+    finally:
+        # Cleanup
+        if vehicle is not None:
+            try:
+                vehicle.apply_control(
+                    carla.VehicleControl(
+                        throttle=0.0, steer=0.0, brake=1.0
+                    )
+                )
+            except Exception:
+                pass
+
+        for sensor in (camera, imu):
+            if sensor is not None:
+                try:
+                    sensor.stop()
+                except Exception:
+                    pass
+                try:
+                    sensor.destroy()
+                except Exception:
+                    pass
+
+        if vehicle is not None:
+            try:
+                vehicle.destroy()
+            except Exception:
+                pass
+
+        if world is not None and original_settings is not None:
+            try:
+                world.apply_settings(original_settings)
+            except Exception:
+                pass
+
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
+    global MODEL_FILE, BRAKE_THRESHOLD, PRINT_TELEMETRY
+    global _last_steering, _last_steering_smoothed
+
     parser = argparse.ArgumentParser(
         description=(
-            "PDM-Lite Neural Driver V9"
-        )
+            "PDM-Lite Neural Driver V14\n\n"
+            "Examples:\n"
+            "  python drive.py --test-towns\n"
+            "    Probe which CARLA towns load OK.\n\n"
+            "  python drive.py --town Town04\n"
+            "    Drive a single route in Town04.\n\n"
+            "  python drive.py --num-routes 5\n"
+            "    Drive 5 random routes in random towns.\n\n"
+            "  python drive.py --num-routes 3 --towns Town01 Town05\n"
+            "    Cycle through Town01 and Town05 for 3 routes.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument(
@@ -2516,821 +3163,299 @@ def main():
         )
     )
 
-    args = parser.parse_args()
-
-    selected_town = (
-        args.town
-        if args.town is not None
-        else random.choice(TOWNS)
+    parser.add_argument(
+        "--model",
+        default=MODEL_FILE,
+        help=(
+            "Path to model checkpoint (.pth). "
+            f"Default: {MODEL_FILE}"
+        )
     )
 
-    client = None
-    world = None
-    vehicle = None
-    camera = None
-    imu = None
+    parser.add_argument(
+        "--brake-threshold",
+        type=float,
+        default=BRAKE_THRESHOLD,
+        help=(
+            "Brake when braking probability exceeds "
+            "this threshold [0, 1]. "
+            f"Default: {BRAKE_THRESHOLD}"
+        )
+    )
 
-    original_settings = None
+    parser.add_argument(
+        "--num-routes",
+        type=int,
+        default=1,
+        help=(
+            "Number of routes to drive in sequence. "
+            "After each route completes (or crashes), "
+            "the next one starts automatically. "
+            "Default: 1"
+        )
+    )
+
+    parser.add_argument(
+        "--test-towns",
+        action="store_true",
+        help=(
+            "Probe each CARLA town to see which ones "
+            "load successfully, then exit. Useful for "
+            "diagnosing segfaults on other maps."
+        )
+    )
+
+    parser.add_argument(
+        "--towns",
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit list of towns to try when "
+            "--num-routes > 1. Example: "
+            "--towns Town01 Town04 Town05. "
+            "If omitted, uses the default TOWNS list."
+        )
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress per-frame terminal telemetry. "
+            "Route info and destination messages still print."
+        )
+    )
+
+    args = parser.parse_args()
+
+    MODEL_FILE = args.model
+    BRAKE_THRESHOLD = float(
+        np.clip(
+            args.brake_threshold,
+            0.0,
+            1.0
+        )
+    )
+
+    num_routes = max(1, args.num_routes)
+
+    if args.quiet:
+        PRINT_TELEMETRY = False
+
     original_cwd = os.getcwd()
 
-    try:
+    # ========================================================
+    # HEADER
+    # ========================================================
 
-        # ====================================================
-        # HEADER
-        # ====================================================
+    print()
+    print("=" * 82)
+
+    print(
+        "                 PDM-LITE NEURAL DRIVER V14"
+    )
+
+    print("=" * 82)
+
+    print(
+        "Device     :",
+        DEVICE
+    )
+
+    print(
+        "Model      :",
+        MODEL_FILE
+    )
+
+    print(
+        "Input      : "
+        f"{MODEL_WIDTH} x "
+        f"{MODEL_HEIGHT}"
+    )
+
+    print(
+        "Telemetry  :",
+        MODEL_TELEMETRY
+    )
+
+    print(
+        "Camera     : "
+        "1024 x 512 / FOV 110"
+    )
+
+    print(
+        "Navigation : "
+        "direct CARLA GlobalRoutePlanner"
+    )
+
+    print(
+        "Routes     :",
+        num_routes,
+    )
+
+    if args.town:
+        print(
+            "Town       :",
+            args.town,
+        )
+    else:
+        print(
+            "Town       : (random)"
+        )
+
+    print("=" * 82)
+
+    # ========================================================
+    # CONNECT TO CARLA (once, reuse across routes)
+    # ========================================================
+
+    client = carla.Client(
+        CARLA_HOST,
+        CARLA_PORT
+    )
+
+    client.set_timeout(60.0)
+
+    print(
+        "CARLA client:",
+        client.get_client_version()
+    )
+
+    print(
+        "CARLA server:",
+        client.get_server_version()
+    )
+
+    # ========================================================
+    # --test-towns: probe and exit
+    # ========================================================
+
+    if args.test_towns:
+        test_towns(client, args.towns or TOWNS)
+        return
+
+    # ========================================================
+    # BUILD TOWN LIST
+    # ========================================================
+
+    # If the user supplied --town, use exactly that town.
+    # Otherwise, try confirmed towns first, then all remaining.
+    if args.town:
+        town_list = [args.town] * num_routes
+    elif args.towns:
+        town_list = [
+            args.towns[i % len(args.towns)]
+            for i in range(num_routes)
+        ]
+    else:
+        # Try loading previously confirmed towns.
+        confirmed = []
+        if os.path.isfile(CONFIRMED_FILE):
+            try:
+                with open(CONFIRMED_FILE) as fh:
+                    confirmed = [
+                        line.strip()
+                        for line in fh
+                        if line.strip()
+                        and line.strip() in TOWNS
+                    ]
+            except Exception:
+                pass
+
+        pool = (
+            confirmed
+            if len(confirmed) >= 2
+            else TOWNS
+        )
+
+        town_list = [
+            random.choice(pool)
+            for _ in range(num_routes)
+        ]
+
+    # ========================================================
+    # LOAD MODEL (once)
+    # ========================================================
+
+    model = load_model()
+
+    # ========================================================
+    # DRIVE ROUTES
+    # ========================================================
+
+    results = []
+
+    for route_idx in range(num_routes):
+        selected_town = town_list[route_idx]
 
         print()
-        print("=" * 82)
-
+        print("#" * 82)
         print(
-            "                 PDM-LITE NEURAL DRIVER V9"
+            f"#  ROUTE {route_idx + 1}/{num_routes}"
+            f"   TOWN: {selected_town}"
         )
+        print("#" * 82)
 
-        print("=" * 82)
-
-        print(
-            "Device     :",
-            DEVICE
-        )
-
-        print(
-            "Model      :",
-            MODEL_FILE
-        )
-
-        print(
-            "Input      : "
-            f"{MODEL_WIDTH} x "
-            f"{MODEL_HEIGHT}"
-        )
-
-        print(
-            "Telemetry  :",
-            MODEL_TELEMETRY
-        )
-
-        print(
-            "Camera     : "
-            "1024 x 512 / FOV 110"
-        )
-
-        print(
-            "Camera pos : "
-            "(-1.5, 0.0, 2.0)"
-        )
-
-        print(
-            "Camera rot : "
-            "(roll 0, pitch 0, yaw 0)"
-        )
-
-        print(
-            "Navigation : "
-            "direct CARLA GlobalRoutePlanner"
-        )
-
-        print(
-            "Route      : "
-            "normalized Waypoint -> Transform"
-        )
-
-        print(
-            "Angle      : "
-            "current vehicle yaw -> route lookahead"
-        )
-
-        print(
-            "Theta      : "
-            "IMU -> preprocess_compass()"
-        )
-
-        print(
-            "Lateral    : "
-            "direct route signed distance / 2"
-        )
-
-        print("=" * 82)
-
-        # ====================================================
-        # CARLA
-        # ====================================================
-
-        client = carla.Client(
-            CARLA_HOST,
-            CARLA_PORT
-        )
-
-        client.set_timeout(
-            10.0
-        )
-
-        world = (
-            load_navigation_town(
+        try:
+            reached = run_single_route(
                 client,
-                selected_town
-            )
-        )
-
-        print(
-            "CARLA client:",
-            client.get_client_version()
-        )
-
-        print(
-            "CARLA server:",
-            client.get_server_version()
-        )
-
-        print(
-            "Active map:",
-            world.get_map().name
-        )
-
-        # ====================================================
-        # SYNC
-        # ====================================================
-
-        original_settings = (
-            world.get_settings()
-        )
-
-        settings = (
-            world.get_settings()
-        )
-
-        settings.synchronous_mode = True
-
-        settings.fixed_delta_seconds = (
-            FIXED_DELTA_SECONDS
-        )
-
-        settings.no_rendering_mode = False
-
-        world.apply_settings(
-            settings
-        )
-
-        print(
-            "Synchronous mode: ON"
-        )
-
-        print(
-            "Fixed delta:",
-            FIXED_DELTA_SECONDS
-        )
-
-        # ====================================================
-        # PDM WORKING DIRECTORY
-        # ====================================================
-
-        os.chdir(
-            PDM_ROOT
-        )
-
-        print(
-            "PDM-Lite working directory:",
-            os.getcwd()
-        )
-
-        # ====================================================
-        # VEHICLE
-        # ====================================================
-
-        vehicle = spawn_vehicle(
-            world
-        )
-
-        # ====================================================
-        # DESTINATION
-        # ====================================================
-
-        (
-            destination,
-            global_route
-        ) = choose_destination(
-            world,
-            vehicle
-        )
-
-        print()
-
-        print(
-            "Selected destination:",
-            destination.location
-        )
-
-        print(
-            "Route points:",
-            len(global_route)
-        )
-
-        print(
-            "Route decisions:",
-            route_turn_summary(
-                global_route
-            )
-            or
-            ["STRAIGHT"]
-        )
-
-        # ====================================================
-        # MODEL
-        # ====================================================
-
-        model = load_model()
-
-        library = (
-            world
-            .get_blueprint_library()
-        )
-
-        # ====================================================
-        # CAMERA
-        #
-        # EXACTLY UNCHANGED
-        # ====================================================
-
-        camera_bp = (
-            library.find(
-                "sensor.camera.rgb"
-            )
-        )
-
-        camera_bp.set_attribute(
-            "image_size_x",
-            str(CAMERA_WIDTH)
-        )
-
-        camera_bp.set_attribute(
-            "image_size_y",
-            str(CAMERA_HEIGHT)
-        )
-
-        camera_bp.set_attribute(
-            "fov",
-            str(CAMERA_FOV)
-        )
-
-        camera_bp.set_attribute(
-            "sensor_tick",
-            str(FIXED_DELTA_SECONDS)
-        )
-
-        camera = world.spawn_actor(
-            camera_bp,
-
-            carla.Transform(
-
-                carla.Location(
-                    x=CAMERA_X,
-                    y=CAMERA_Y,
-                    z=CAMERA_Z
-                ),
-
-                carla.Rotation(
-                    roll=CAMERA_ROLL,
-                    pitch=CAMERA_PITCH,
-                    yaw=CAMERA_YAW
-                )
-            ),
-
-            attach_to=vehicle
-        )
-
-        camera.listen(
-            camera_callback
-        )
-
-        # ====================================================
-        # IMU
-        # ====================================================
-
-        imu_bp = (
-            library.find(
-                "sensor.other.imu"
-            )
-        )
-
-        imu_bp.set_attribute(
-            "sensor_tick",
-            str(IMU_SENSOR_TICK)
-        )
-
-        imu = world.spawn_actor(
-
-            imu_bp,
-
-            carla.Transform(
-
-                carla.Location(
-                    x=0.0,
-                    y=0.0,
-                    z=0.0
-                )
-            ),
-
-            attach_to=vehicle
-        )
-
-        imu.listen(
-            imu_callback
-        )
-
-        print()
-        print(
-            "PDM-Lite sensors:"
-        )
-
-        print(
-            f"  Camera: "
-            f"{CAMERA_WIDTH}x"
-            f"{CAMERA_HEIGHT} "
-            f"FOV={CAMERA_FOV}"
-        )
-
-        print(
-            f"  Camera position: "
-            f"{CAMERA_X}, "
-            f"{CAMERA_Y}, "
-            f"{CAMERA_Z}"
-        )
-
-        print(
-            "  Camera rotation: "
-            "roll=0 pitch=0 yaw=0"
-        )
-
-        print(
-            "  IMU: compass"
-        )
-
-        # ====================================================
-        # PRIME
-        # ====================================================
-
-        print(
-            "Waiting for synchronized sensors..."
-        )
-
-        frame = world.tick()
-
-        camera_data = (
-            get_sensor_frame_data(
-                camera_queue,
-                frame
-            )
-        )
-
-        imu_data = (
-            get_sensor_frame_data(
-                imu_queue,
-                frame
-            )
-        )
-
-        (
-            compass,
-            initial_theta
-        ) = (
-            get_pdm_theta(
-                imu_data
-            )
-        )
-
-        vehicle_yaw = (
-            vehicle
-            .get_transform()
-            .rotation
-            .yaw
-        )
-
-        print(
-            f"Vehicle yaw: "
-            f"{vehicle_yaw:+.6f} deg"
-        )
-
-        print(
-            f"IMU compass: "
-            f"{compass:+.9f} rad"
-        )
-
-        print(
-            f"Initial PDM-Lite theta: "
-            f"{initial_theta:+.9f}"
-        )
-
-        print(
-            "Camera ready."
-        )
-
-        # ====================================================
-        # DIRECT ROUTE STATE
-        # ====================================================
-
-        route_state = CarlaRouteState(
-            world,
-            vehicle,
-            global_route
-        )
-
-        # ====================================================
-        # INITIAL BRAKE
-        # ====================================================
-
-        vehicle.apply_control(
-            carla.VehicleControl(
-                throttle=0.0,
-                steer=0.0,
-                brake=1.0
-            )
-        )
-
-        world.tick()
-
-        # ====================================================
-        # DRIVING
-        # ====================================================
-
-        print()
-        print("=" * 82)
-        print("DRIVING")
-        print("=" * 82)
-
-        print(
-            "Navigation = direct CARLA "
-            "GlobalRoutePlanner"
-        )
-
-        print(
-            "Angle = current vehicle yaw "
-            "to route lookahead"
-        )
-
-        print(
-            "Lateral = current vehicle position "
-            "relative to route"
-        )
-
-        print(
-            "Theta = IMU model feature"
-        )
-
-        print(
-            "Camera = unchanged"
-        )
-
-        print(
-            "Press Q to stop."
-        )
-
-        print(
-            "Destination:",
-            destination.location
-        )
-
-        print(
-            "Route decisions:",
-            route_turn_summary(
-                global_route
-            )
-            or
-            ["STRAIGHT"]
-        )
-
-        # ====================================================
-        # MAIN LOOP
-        # ====================================================
-
-        while True:
-
-            frame = world.tick()
-
-            camera_data = (
-                get_sensor_frame_data(
-                    camera_queue,
-                    frame
-                )
-            )
-
-            imu_data = (
-                get_sensor_frame_data(
-                    imu_queue,
-                    frame
-                )
-            )
-
-            # ------------------------------------------------
-            # IMAGE
-            # ------------------------------------------------
-
-            rgb = image_to_rgb(
-                camera_data
-            )
-
-            # ------------------------------------------------
-            # THETA
-            # ------------------------------------------------
-
-            (
-                compass,
-                theta
-            ) = (
-                get_pdm_theta(
-                    imu_data
-                )
-            )
-
-            # ------------------------------------------------
-            # ROUTE
-            # ------------------------------------------------
-
-            route_state.update()
-
-            # ------------------------------------------------
-            # TELEMETRY
-            # ------------------------------------------------
-
-            (
-                telemetry,
-                raw
-            ) = build_model_telemetry(
-                vehicle,
-                world,
-                route_state,
-                theta
-            )
-
-            # ------------------------------------------------
-            # HARD SANITY CHECKS
-            # ------------------------------------------------
-
-            if not (
-                -1.0
-                <=
-                float(telemetry[7])
-                <=
-                1.0
-            ):
-
-                raise RuntimeError(
-                    "Angle outside model range: "
-                    f"{telemetry[7]}"
-                )
-
-            if not (
-                -1.0
-                <=
-                float(telemetry[9])
-                <=
-                1.0
-            ):
-
-                raise RuntimeError(
-                    "Theta outside model range: "
-                    f"{telemetry[9]}"
-                )
-
-            if not (
-                -1.0
-                <=
-                float(telemetry[10])
-                <=
-                1.0
-            ):
-
-                raise RuntimeError(
-                    "Lateral outside model range: "
-                    f"{telemetry[10]}"
-                )
-
-            if not np.all(
-                np.isfinite(
-                    telemetry
-                )
-            ):
-
-                raise RuntimeError(
-                    "Telemetry contains NaN/Inf."
-                )
-
-            # ------------------------------------------------
-            # MODEL
-            # ------------------------------------------------
-
-            (
-                steering,
-                throttle,
-                brake_logit,
-                brake_probability
-            ) = run_model(
+                selected_town,
                 model,
-                rgb,
-                telemetry
+                route_index=route_idx,
+                num_routes=num_routes,
+            )
+            results.append(
+                (selected_town, "reached" if reached else "quit")
             )
 
-            # ------------------------------------------------
-            # CONTROL
-            # ------------------------------------------------
+        except Exception as exc:
+            results.append((selected_town, f"error: {exc}"))
 
-            (
-                applied_steering,
-                applied_throttle,
-                applied_brake
-            ) = apply_control(
-                vehicle,
-                steering,
-                throttle,
-                brake_probability
+            print()
+            print(
+                f"Route {route_idx + 1} failed: "
+                f"{type(exc).__name__}: {exc}"
             )
 
-            # ------------------------------------------------
-            # DEBUG
-            # ------------------------------------------------
-
-            if PRINT_TELEMETRY:
-
-                print_debug(
-                    telemetry,
-                    raw,
-                    vehicle,
-                    compass,
-                    theta,
-                    applied_steering,
-                    applied_throttle,
-                    brake_logit,
-                    brake_probability
+            # If a town segfaults, try to move to a
+            # different one for the next route.
+            if route_idx + 1 < num_routes:
+                fallback = random.choice(
+                    [t for t in TOWNS if t != selected_town]
                 )
-
-            # ------------------------------------------------
-            # CAMERA WINDOW
-            # ------------------------------------------------
-
-            show_camera(
-                rgb,
-                telemetry,
-                raw,
-                applied_steering,
-                applied_throttle,
-                brake_probability
-            )
-
-            if (
-                SHOW_CAMERA
-                and
-                (
-                    cv2.waitKey(1)
-                    &
-                    0xFF
-                )
-                ==
-                ord("q")
-            ):
-
+                town_list[route_idx + 1] = fallback
                 print(
-                    "\nQ pressed."
+                    f"  Falling back to {fallback}"
+                    f" for next route."
                 )
 
-                break
+    # ========================================================
+    # SUMMARY
+    # ========================================================
 
-            # ------------------------------------------------
-            # DESTINATION
-            # ------------------------------------------------
+    print()
+    print("=" * 82)
+    print("SESSION SUMMARY")
+    print("=" * 82)
 
-            if PRINT_TELEMETRY:
-
-                distance_to_destination = (
-                    vehicle
-                    .get_location()
-                    .distance(
-                        destination.location
-                    )
-                )
-
-                print(
-                    f"Distance to destination: "
-                    f"{distance_to_destination:.2f} m"
-                )
-
-    except KeyboardInterrupt:
-
+    for idx, (town, outcome) in enumerate(results):
         print(
-            "\nKeyboard interrupt."
+            f"  Route {idx + 1}: "
+            f"{town:<12}  {outcome}"
         )
 
-    except Exception as exc:
+    print("=" * 82)
 
-        print()
-        print("=" * 82)
-        print("DRIVER ERROR")
-        print("=" * 82)
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
-        print(
-            f"{type(exc).__name__}: "
-            f"{exc}"
-        )
+    try:
+        os.chdir(original_cwd)
+    except Exception:
+        pass
 
-        traceback.print_exc()
-
-    finally:
-
-        print()
-        print("=" * 82)
-        print("SHUTTING DOWN")
-        print("=" * 82)
-
-        # ----------------------------------------------------
-        # BRAKE
-        # ----------------------------------------------------
-
-        if vehicle is not None:
-
-            try:
-
-                vehicle.apply_control(
-                    carla.VehicleControl(
-                        throttle=0.0,
-                        steer=0.0,
-                        brake=1.0
-                    )
-                )
-
-            except Exception:
-                pass
-
-        # ----------------------------------------------------
-        # SENSORS
-        # ----------------------------------------------------
-
-        for sensor in (
-            camera,
-            imu
-        ):
-
-            if sensor is not None:
-
-                try:
-                    sensor.stop()
-                except Exception:
-                    pass
-
-                try:
-                    sensor.destroy()
-                except Exception:
-                    pass
-
-        # ----------------------------------------------------
-        # VEHICLE
-        # ----------------------------------------------------
-
-        if vehicle is not None:
-
-            try:
-                vehicle.destroy()
-            except Exception:
-                pass
-
-        # ----------------------------------------------------
-        # WORLD SETTINGS
-        # ----------------------------------------------------
-
-        if (
-            world is not None
-            and
-            original_settings is not None
-        ):
-
-            try:
-
-                world.apply_settings(
-                    original_settings
-                )
-
-            except Exception:
-                pass
-
-        # ----------------------------------------------------
-        # WINDOWS
-        # ----------------------------------------------------
-
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
-
-        # ----------------------------------------------------
-        # CWD
-        # ----------------------------------------------------
-
-        try:
-            os.chdir(
-                original_cwd
-            )
-        except Exception:
-            pass
-
-        print(
-            "Driver stopped."
-        )
+    print("Driver stopped.")
 
 
 # ============================================================

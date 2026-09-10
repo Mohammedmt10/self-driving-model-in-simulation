@@ -79,45 +79,90 @@ def build_path_index(base_paths):
     return all_paths
 
 
-# ============================================================
-# OBJECT TYPE MAP
-# ============================================================
+def _parse_route_num(route_folder_name):
+    """Extract the route number from a folder name like 'Route12_Rep0'."""
+    try:
+        return int(route_folder_name.split("_")[0].replace("Route", ""))
+    except (ValueError, IndexError):
+        return -1
 
-OBJECT_TYPE_MAP = {
 
-    "None": 0,
-    None: 0,
+def _build_route_pairs(route_folder):
+    """Return [(image_path, measurement_path), ...] for one route folder."""
+    rgb_folder = os.path.join(route_folder, "rgb")
+    measurements_folder = os.path.join(route_folder, "measurements")
+    if not os.path.isdir(rgb_folder) or not os.path.isdir(measurements_folder):
+        return []
 
-    "traffic.stop": 1,
-    "traffic.traffic_light": 2,
+    pairs = []
+    for img_file in os.listdir(rgb_folder):
+        base_name = os.path.splitext(img_file)[0]
+        img_path = os.path.join(rgb_folder, img_file)
+        json_path = os.path.join(measurements_folder, base_name + ".json.gz")
+        if os.path.isfile(json_path):
+            pairs.append((img_path, json_path))
+    return pairs
 
-    "vehicle.audi.tt": 3,
-    "vehicle.carlamotors.firetruck": 3,
-    "vehicle.chevrolet.impala": 3,
-    "vehicle.diamondback.century": 3,
-    "vehicle.dodge.charger_2020": 3,
-    "vehicle.dodge.charger_police": 3,
-    "vehicle.dodge.charger_police_2020": 3,
-    "vehicle.ford.ambulance": 3,
-    "vehicle.ford.mustang": 3,
-    "vehicle.lincoln.mkz_2017": 3,
-    "vehicle.lincoln.mkz_2020": 3,
-    "vehicle.mercedes.coupe_2020": 3,
-    "vehicle.mini.cooper_s_2021": 3,
-    "vehicle.nissan.patrol_2021": 3,
 
-    "walker.pedestrian.0001": 4,
-    "walker.pedestrian.0002": 4,
-    "walker.pedestrian.0005": 4,
-    "walker.pedestrian.0010": 4,
-    "walker.pedestrian.0014": 4,
-    "walker.pedestrian.0020": 4,
-    "walker.pedestrian.0030": 4,
-    "walker.pedestrian.0036": 4,
-    "walker.pedestrian.0038": 4,
-    "walker.pedestrian.0044": 4,
-    "walker.pedestrian.0047": 4,
-}
+def build_route_split(towns_dir, val_fraction=0.2):
+    """
+    Route-based train/validation split across all towns.
+
+    For each (town, scenario) group, the Route* folders are sorted by
+    route number and split ~80/20 by route: the first 80% of routes go
+    to training, the last 20% to validation. Validation therefore holds
+    out entire *routes* (unseen road paths) rather than entire towns, so
+    the model still trains on every town's roads.
+
+    Returns (train_list, val_list), each a list of
+    (image_path, measurement_path) tuples.
+    """
+    train_list = []
+    val_list = []
+
+    for town in sorted(os.listdir(towns_dir)):
+        town_dir = os.path.join(towns_dir, town)
+        if not os.path.isdir(town_dir):
+            continue
+        data_dir = os.path.join(town_dir, "data")
+        if not os.path.isdir(data_dir):
+            continue
+
+        for scenario in sorted(os.listdir(data_dir)):
+            scenario_dir = os.path.join(data_dir, scenario)
+            if not os.path.isdir(scenario_dir):
+                continue
+
+            route_folders = sorted(
+                (
+                    p for p in os.listdir(scenario_dir)
+                    if p.startswith("Route")
+                    and os.path.isdir(os.path.join(scenario_dir, p))
+                ),
+                key=_parse_route_num,
+            )
+
+            if not route_folders:
+                continue
+
+            n_val = int(round(len(route_folders) * val_fraction))
+            # Keep at least one route for training when possible.
+            if len(route_folders) > 1:
+                n_val = min(max(n_val, 1), len(route_folders) - 1)
+            else:
+                n_val = 0
+            n_train = len(route_folders) - n_val
+
+            for route in route_folders[:n_train]:
+                train_list.extend(
+                    _build_route_pairs(os.path.join(scenario_dir, route))
+                )
+            for route in route_folders[n_train:]:
+                val_list.extend(
+                    _build_route_pairs(os.path.join(scenario_dir, route))
+                )
+
+    return train_list, val_list
 
 
 # ============================================================
@@ -203,9 +248,11 @@ def calculate_lateral_distance(telemetry):
 
     in this coordinate frame.
 
-    We use the first route segment and calculate the signed
+    We find the NEAREST route segment and compute the signed
     perpendicular distance from the ego position to that
-    segment's supporting line.
+    segment's supporting line. This matches how the driver
+    (drive.py -> CarlaRouteState.calculate_lateral_distance)
+    computes lateral distance at inference time.
 
     Sign convention:
 
@@ -225,11 +272,13 @@ def calculate_lateral_distance(telemetry):
         return 0.0
 
     # --------------------------------------------------------
-    # Find first two valid route points.
+    # Nearest-range check (same convention as drive.py).
     # --------------------------------------------------------
 
-    p1 = None
-    p2 = None
+    eps = 1e-9
+
+    best_abs = float("inf")
+    best_lateral = 0.0
 
     for i in range(len(route) - 1):
 
@@ -258,86 +307,146 @@ def calculate_lateral_distance(telemetry):
         )
 
         # Ignore duplicate / invalid points.
-        if length < 1e-6:
+        if length < eps:
             continue
 
-        p1 = (x1, y1)
-        p2 = (x2, y2)
+        # ----------------------------------------------------
+        # Route tangent and CARLA right vector in the LOCAL XY
+        # plane.  For a route pointing straight forward:
+        #
+        #     tangent = (1, 0)
+        #     right   = (0, 1)   (= CARLA +Y)
+        # ----------------------------------------------------
 
-        break
+        tx = dx / length
+        ty = dy / length
 
-    if p1 is None or p2 is None:
-        return 0.0
+        right_x = -ty
+        right_y = tx
 
-    x1, y1 = p1
-    x2, y2 = p2
+        # ----------------------------------------------------
+        # Signed perpendicular distance from the ego (origin,
+        # 0,0) to this segment's supporting line.
+        #
+        # Negative -> left of route.
+        # Positive -> right of route.
+        # ----------------------------------------------------
 
-    # --------------------------------------------------------
-    # Route tangent.
-    # --------------------------------------------------------
+        lateral = (
+            (0.0 - x1) * right_x +
+            (0.0 - y1) * right_y
+        )
 
-    dx = x2 - x1
-    dy = y2 - y1
+        if abs(lateral) < best_abs:
 
-    length = math.sqrt(
-        dx * dx +
-        dy * dy
-    )
+            best_abs = abs(lateral)
+            best_lateral = lateral
 
-    tx = dx / length
-    ty = dy / length
+    return float(best_lateral)
 
-    # --------------------------------------------------------
-    # CARLA right vector in the LOCAL XY plane.
-    #
-    # For a route pointing straight forward:
-    #
-    # tangent = (1, 0)
-    #
-    # right = (0, 1)
-    #
-    # which is exactly CARLA's +Y direction.
-    # --------------------------------------------------------
 
-    right_x = -ty
-    right_y = tx
+# ============================================================
+# IMAGE
+#
+# Single source of truth for how training images are loaded.
+# IMAGE_SPEC documents the pipeline; CarlaDataset.transform is
+# built FROM it, so the code and its description cannot drift.
+#
+# Pipeline (must match drive.py run_model / IMAGE_TRANSFORM):
+#
+#   [stored PNG, RGB, 512 x 1024]  (written by the CARLA camera)
+#       -> mpimg.imread  -> float32 [0, 1] (H, W, 3)
+#       -> drop top 30%            (sky / buildings / trees)
+#       -> ToPILImage
+#       -> grayscale (luminance)
+#       -> resize to 480 x 240     (H, W)
+#       -> ToTensor -> float32 tensor (1, 240, 480), values in [0, 1]
+#       -> NO mean/std normalization
+# ============================================================
 
-    # --------------------------------------------------------
-    # Ego position in its own local coordinate frame.
-    # --------------------------------------------------------
+IMAGE_SPEC = {
+    # --- input ---
+    "input": {
+        "channels": "RGB",
+        "dtype": "float32 (mpimg.imread)",
+        "range": [0.0, 1.0],
+        "height": 512,
+        "width": 1024,
+    },
+    # --- crop ---
+    "crop": {
+        "ratio": 0.3,
+        "expr": "int(0.3 * image.shape[0])",
+        "px": 153,
+        "note": (
+            "top of the frame is removed before resize, "
+            "exactly like drive.py"
+        ),
+    },
+    # --- grayscale ---
+    "grayscale": True,
+    "grayscale_formula": (
+        "luminance: 0.299 R + 0.587 G + 0.114 B"
+    ),
+    # --- resize ---
+    "resize": (240, 480),   # (H, W)
+    "resize_interpolation": (
+        "BILINEAR (torchvision Resize default)"
+    ),
+    # --- output tensor ---
+    "output": {
+        "channels": 1,
+        "shape": (1, 240, 480),
+        "dtype": "float32",
+        "range": [0.0, 1.0],
+        "normalization": "none (raw [0,1])",
+    },
+    # --- reference statistics ---
+    "note": (
+        "IMG_MEAN / IMG_STD (0.4020 / 0.1886) are whole-dataset "
+        "statistics for reference only, NOT applied here — the "
+        "model trains on raw [0,1] grayscale."
+    ),
+}
 
-    ego_x = 0.0
-    ego_y = 0.0
 
-    # --------------------------------------------------------
-    # Vector from route point to ego.
-    # --------------------------------------------------------
+def report_image_spec(title="DATASET LOAD IMAGE SPEC"):
 
-    relative_x = ego_x - x1
-    relative_y = ego_y - y1
+    """
+    Print the exact image format the dataset produces, so it can
+    be compared against the driver inference path without reading
+    either implementation.
+    """
 
-    # --------------------------------------------------------
-    # Signed lateral distance.
-    #
-    # Negative:
-    #     ego is left of route.
-    #
-    # Positive:
-    #     ego is right of route.
-    # --------------------------------------------------------
+    print()
+    print(title)
+    print("-" * 70)
 
-    lateral_distance = (
-        relative_x * right_x +
-        relative_y * right_y
-    )
+    for key, value in IMAGE_SPEC.items():
 
-    return float(lateral_distance)
+        if isinstance(value, dict):
+
+            print(f"{key}:")
+
+            for sub_key, sub_value in value.items():
+
+                print(
+                    f"    {sub_key:<20}: {sub_value}"
+                )
+
+        else:
+
+            print(
+                f"{key:<20}: {value}"
+            )
+
+    print("-" * 70)
 
 
 # ============================================================
 # DATASET
 #
-# EXACTLY 11 TELEMETRY VALUES
+# EXACTLY 8 TELEMETRY VALUES
 # ============================================================
 
 class CarlaDataset(Dataset):
@@ -348,9 +457,11 @@ class CarlaDataset(Dataset):
 
         self.transform = transforms.Compose([
             transforms.ToPILImage(),
-            transforms.Resize((200, 400)),
+            transforms.Grayscale(),
+            transforms.Resize(IMAGE_SPEC["resize"]),
             transforms.ToTensor(),
         ])
+
 
     def __len__(self):
 
@@ -402,12 +513,6 @@ class CarlaDataset(Dataset):
             telemetry.get("speed_limit") or 50.0
         )
 
-        object_distance = float(
-            telemetry.get(
-                "speed_reduced_by_obj_distance"
-            ) or 0.0
-        )
-
         # ----------------------------------------------------
         # DO NOT CHANGE THESE.
         # ----------------------------------------------------
@@ -439,41 +544,6 @@ class CarlaDataset(Dataset):
         )
 
         # ====================================================
-        # OBJECT TYPE
-        # ====================================================
-
-        object_type = OBJECT_TYPE_MAP.get(
-            telemetry.get(
-                "speed_reduced_by_obj_type"
-            ),
-            0
-        )
-
-        object_type = max(
-            0,
-            min(object_type, 4)
-        )
-
-        # ====================================================
-        # OBJECT ID
-        # ====================================================
-
-        try:
-
-            object_id = int(
-                telemetry.get(
-                    "speed_reduced_by_obj_id"
-                ) or -1
-            )
-
-        except (
-            TypeError,
-            ValueError
-        ):
-
-            object_id = -1
-
-        # ====================================================
         # LATERAL DISTANCE
         # ====================================================
 
@@ -499,14 +569,6 @@ class CarlaDataset(Dataset):
             speed_limit / 30.0,
             0.0,
             2.0
-        )
-
-        # Object distance:
-        # 50 m reference.
-        object_distance = np.clip(
-            object_distance / 50.0,
-            0.0,
-            1.0
         )
 
         # ----------------------------------------------------
@@ -550,19 +612,16 @@ class CarlaDataset(Dataset):
         )
 
         # ====================================================
-        # EXACT 11 INPUTS
+        # EXACT 8 INPUTS
         #
         # 0  speed
         # 1  command
         # 2  junction
-        # 3  object_type
-        # 4  object_id
-        # 5  object_distance
-        # 6  speed_limit
-        # 7  angle
-        # 8  next_command
-        # 9  theta
-        # 10 lateral_distance
+        # 3  speed_limit
+        # 4  angle
+        # 5  next_command
+        # 6  theta
+        # 7  lateral_distance
         # ====================================================
 
         telemetry_tensor = torch.tensor(
@@ -570,9 +629,6 @@ class CarlaDataset(Dataset):
                 speed,
                 command,
                 junction,
-                object_type,
-                object_id,
-                object_distance,
                 speed_limit,
                 angle,
                 next_command,
@@ -595,9 +651,16 @@ class CarlaDataset(Dataset):
             copy=True
         )
 
+        # Drop the top 30% (sky / buildings / trees) to remove
+        # route-correlated scene context that causes overfitting.
+        # Must stay in sync with IMAGE_SPEC above and with
+        # drive.py -> IMAGE_CROP_RATIO.
+        image = image[int(0.3 * image.shape[0]):, :]
+
         image_tensor = self.transform(
             image
         )
+
 
         # ====================================================
         # TARGET
@@ -700,6 +763,107 @@ def get_steering_sampling_weights(master_list):
         sample_weights,
         counts
     )
+
+
+# ============================================================
+# LOSS NORMALIZATION WEIGHTS (BASELINE LOSS)
+# ============================================================
+
+def compute_loss_weights(master_list):
+
+    """
+    Compute per-output loss-normalization weights directly from
+    the training data -- no assumed scales.
+
+    Each weight is the loss a trivial constant predictor achieves
+    on that task:
+
+        steer    -> MSE of predicting the mean steer
+                    (= variance of steer)
+        throttle -> MSE of predicting the mean throttle
+                    (= variance of throttle)
+        brake    -> cross-entropy of predicting the marginal
+                    class distribution (= entropy)
+
+    Dividing each raw task loss by its weight makes every task
+    contribute ~1.0 to the total at the start of training.
+    """
+
+    steer_sum = 0.0
+    steer_sq_sum = 0.0
+    throttle_sum = 0.0
+    throttle_sq_sum = 0.0
+    brake_ones = 0
+    n = 0
+
+    for _, json_path in master_list:
+
+        with gzip.open(
+            json_path,
+            "rt",
+            encoding="utf-8"
+        ) as f:
+
+            telemetry = json.load(f)
+
+        steer = float(
+            telemetry.get("steer") or 0.0
+        )
+
+        throttle = float(
+            telemetry.get("throttle") or 0.0
+        )
+
+        brake = float(
+            bool(
+                telemetry.get("control_brake") or False
+            )
+        )
+
+        steer_sum += steer
+        steer_sq_sum += steer * steer
+        throttle_sum += throttle
+        throttle_sq_sum += throttle * throttle
+        brake_ones += brake
+        n += 1
+
+    n = max(n, 1)
+
+    steer_mean = steer_sum / n
+    throttle_mean = throttle_sum / n
+
+    # E[y^2] - E[y]^2 == MSE of predicting the mean.
+    steer_var = max(
+        steer_sq_sum / n - steer_mean * steer_mean,
+        1e-9
+    )
+
+    throttle_var = max(
+        throttle_sq_sum / n - throttle_mean * throttle_mean,
+        1e-9
+    )
+
+    # Binary cross-entropy of predicting the marginal distribution.
+    p_brake = min(
+        max(brake_ones / n, 1e-9),
+        1.0 - 1e-9
+    )
+
+    brake_entropy = -(
+        p_brake * math.log(p_brake) +
+        (1.0 - p_brake) * math.log(1.0 - p_brake)
+    )
+
+    return {
+        "steer": steer_var,
+        "throttle": throttle_var,
+        "brake": brake_entropy,
+        "counts": {
+            "n": n,
+            "brake_ones": brake_ones,
+            "p_brake": p_brake,
+        },
+    }
 
 
 # ============================================================

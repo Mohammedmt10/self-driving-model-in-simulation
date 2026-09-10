@@ -2,1514 +2,212 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import ( DataLoader, WeightedRandomSampler )
-from dataset import ( CarlaDataset, build_path_index, get_steering_sampling_weights, summarize_steering_distribution)
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from dataset import (CarlaDataset, build_route_split,
+                     summarize_steering_distribution,
+                     get_steering_sampling_weights,
+                     compute_loss_weights)
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
-NUM_TELEMETRY = 11
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 EPOCHS = 15
-LEARNING_RATE = 2e-5
-VAL_RATIO = 0.15
+LEARNING_RATE = 3e-4
 SEED = 42
 
-CHECKPOINT = "model_v9.pth"
+CHECKPOINT = "model_v14.pth"
 
-
-# ============================================================
-# MODEL
-# ============================================================
 
 class AutonomousDriver(nn.Module):
 
     def __init__(self):
-
         super().__init__()
-
-        # ====================================================
-        # VISION BRANCH
-        # Input:
-        #   [B, 3, 200, 400]
-        #
-        # Output:
-        #   [B, 500]
-        # ====================================================
-
         self.vision_branch = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((10, 10)),
-            nn.Flatten(),
-            nn.Linear(128 * 10 * 10, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 500),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2)
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.AdaptiveMaxPool2d((5, 5)),
+            nn.Flatten(),          # 256 * 5 * 5 = 6400
+            nn.Dropout(0.3),
+            nn.Linear(6400, 512),
+            nn.ReLU(),
         )
-
-        # ====================================================
-        # VEHICLE STATE
-        #
-        # Telemetry:
-        #
-        # 0 speed
-        # 6 speed_limit
-        # 7 angle
-        # 9 theta
-        # 10 lateral_distance
-        #
-        # Total = 5
-        #
-        # Output = 64
-        # ====================================================
+        self.vision_out_dim = 512
 
         self.vehicle_state_branch = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 64),
-            nn.ReLU(inplace=True)
+            nn.Linear(5, 128),
+            nn.ReLU(),
+            nn.RMSNorm(128),
+            nn.Dropout(0.4),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.RMSNorm(128),
+            nn.Dropout(0.4),
         )
-
-        # ====================================================
-        # JUNCTION
-        #
-        # Telemetry:
-        #
-        # 2 junction
-        #
-        # Output = 32
-        # ====================================================
 
         self.junction_state_branch = nn.Sequential(
             nn.Linear(1, 16),
-            nn.ReLU(inplace=True),
-            nn.Linear(16, 32),
-            nn.ReLU(inplace=True)
+            nn.ReLU(),
+            nn.RMSNorm(16),
+            nn.Dropout(0.4),
+            nn.Linear(16, 16),
+            nn.ReLU(),
+            nn.RMSNorm(16),
+            nn.Dropout(0.4),
         )
 
-        # ====================================================
-        # COMMAND
-        #
-        # Values:
-        #
-        # 1 LEFT
-        # 2 RIGHT
-        # 3 STRAIGHT
-        # 4 LANEFOLLOW
-        # 5 CHANGE_LANE_LEFT
-        # 6 CHANGE_LANE_RIGHT
-        #
-        # 0 is reserved.
-        # ====================================================
+        self.command_embedding = nn.Embedding(7, 16)
+        self.next_command_embedding = nn.Embedding(7, 16)
 
-        self.command_embedding = nn.Embedding(7, 32)
-
-        # ====================================================
-        # NEXT COMMAND
-        # ====================================================
-
-        self.next_command_embedding = nn.Embedding(7, 32)
-
-        # ====================================================
-        # OBJECT TYPE
-        #
-        # 0 None
-        # 1 stop
-        # 2 traffic light
-        # 3 vehicle
-        # 4 pedestrian
-        # ====================================================
-
-        self.object_type_embedding = nn.Embedding(5, 16)
-
-        # ====================================================
-        # OBJECT STATE
-        #
-        # 16 object-type embedding
-        # 1 object ID
-        # 1 object distance
-        #
-        # Total = 18
-        #
-        # Output = 64
-        # ====================================================
-
-        self.object_state_branch = nn.Sequential(
-            nn.Linear(18, 32),
-            nn.ReLU(inplace=True),
-            nn.Linear(32, 64),
-            nn.ReLU(inplace=True)
-        )
-
-        # ====================================================
-        # FUSION
-        #
-        # Vehicle       = 64
-        # Junction      = 32
-        # Command       = 32
-        # Next command  = 32
-        # Object        = 64
-        # Vision        = 500
-        #
-        # TOTAL         = 724
-        # ====================================================
-
+        # Fusion: vision(512) + vehicle(128) + junction(16) + command(16)
+        #         + next_command(16) = 688
         self.fusion_branch = nn.Sequential(
-            nn.Linear(724, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True)
+            nn.Linear(512 + 128 + 16 + 16 + 16, 128),
+            nn.ReLU(),
+            nn.RMSNorm(128),
+            nn.Dropout(0.5),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.RMSNorm(128),
+            nn.Dropout(0.5),
         )
-
-        # ====================================================
-        # STEERING HEAD
-        #
-        # Output range:
-        # [-1, 1]
-        # ====================================================
 
         self.steering_head = nn.Sequential(
-            nn.Linear(128, 1),
-            nn.Tanh()
+            nn.Linear(128, 64),
+            nn.Linear(64, 32),
+            nn.Linear(32, 16),
+            nn.Linear(16,1),
+            nn.Tanh(),
         )
-
-        # ====================================================
-        # THROTTLE HEAD
-        #
-        # Output range:
-        # [0, 1]
-        # ====================================================
 
         self.throttle_head = nn.Sequential(
-            nn.Linear(128,1),
-            nn.Sigmoid()
+            nn.Linear(128, 64),
+            nn.Linear(64, 32),
+            nn.Linear(32, 16),
+            nn.Linear(16,1),
+            nn.Sigmoid(),
         )
 
-        # ====================================================
-        # BRAKE HEAD
-        #
-        # IMPORTANT:
-        #
-        # This outputs a LOGIT.
-        #
-        # sigmoid() is applied only when interpreting
-        # the output as a probability.
-        # ====================================================
+        self.brake_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.Linear(64, 32),
+            nn.Linear(32, 16),
+            nn.Linear(16, 2),
 
-        self.brake_head = nn.Linear(128,1)
+        )
 
-    # ========================================================
-    # FORWARD
-    # ========================================================
-
-    def forward(self,image_input,telemetry_input):
-
-        # ====================================================
-        # CHECK TELEMETRY
-        # ====================================================
-
-        if telemetry_input.ndim != 2:
-
-            raise RuntimeError(
-                "Telemetry must have shape [B, 11]. "
-                f"Got {telemetry_input.shape}"
-            )
-
-        if telemetry_input.shape[1] != NUM_TELEMETRY:
-
-            raise RuntimeError(
-                "Model expects exactly "
-                f"{NUM_TELEMETRY} telemetry values. "
-                f"Got {telemetry_input.shape[1]}"
-            )
-
-        # ====================================================
-        # TELEMETRY INDICES
-        #
-        # 0  speed
-        # 1  command
-        # 2  junction
-        # 3  object_type
-        # 4  object_id
-        # 5  object_distance
-        # 6  speed_limit
-        # 7  angle
-        # 8  next_command
-        # 9  theta
-        # 10 lateral_distance
-        # ====================================================
+    def forward(self, image_input, telemetry_input):
 
         speed = telemetry_input[:, 0:1]
-        command = (
-            telemetry_input[:, 1]
-            .long()
-            .clamp(0, 6)
-        )
+        command = telemetry_input[:, 1].long().clamp(1, 6)
         junction = telemetry_input[:, 2:3]
-        object_type = (
-            telemetry_input[:, 3]
-            .long()
-            .clamp(0, 4)
-        )
-        object_id = telemetry_input[:, 4:5]
-        object_distance = telemetry_input[:, 5:6]
-        speed_limit = telemetry_input[:, 6:7]
-        angle = telemetry_input[:, 7:8]
-        next_command = (
-            telemetry_input[:, 8]
-            .long()
-            .clamp(0, 6)
-        )
-        theta = telemetry_input[:, 9:10]
-        lateral_distance = telemetry_input[:, 10:11]
-
-        # ====================================================
-        # VEHICLE STATE
-        # ====================================================
+        speed_limit = telemetry_input[:, 3:4]
+        angle = telemetry_input[:, 4:5]
+        next_command = telemetry_input[:, 5].long().clamp(1, 6)
+        theta = telemetry_input[:, 6:7]
+        lateral_distance = telemetry_input[:, 7:8]
 
         vehicle_state = torch.cat(
-            (
-                speed,
-                speed_limit,
-                angle,
-                theta,
-                lateral_distance
-            ),
-            dim=1
+            (speed, speed_limit, angle, theta, lateral_distance), dim=1
         )
+        vehicle_features = self.vehicle_state_branch(vehicle_state)
 
-        vehicle_features = (
-            self.vehicle_state_branch(
-                vehicle_state
-            )
-        )
+        junction_features = self.junction_state_branch(junction)
 
-        # ====================================================
-        # JUNCTION
-        # ====================================================
+        command_features = self.command_embedding(command)
+        next_command_features = self.next_command_embedding(next_command)
 
-        junction_features = (
-            self.junction_state_branch(
-                junction
-            )
-        )
-
-        # ====================================================
-        # COMMAND
-        # ====================================================
-
-        command_features = (
-            self.command_embedding(
-                command
-            )
-        )
-
-        # ====================================================
-        # NEXT COMMAND
-        # ====================================================
-
-        next_command_features = (
-            self.next_command_embedding(
-                next_command
-            )
-        )
-
-        # ====================================================
-        # OBJECT TYPE
-        # ====================================================
-
-        object_type_features = (
-            self.object_type_embedding(
-                object_type
-            )
-        )
-
-        # ====================================================
-        # OBJECT STATE
-        # ====================================================
-
-        object_state = torch.cat(
-            (
-                object_type_features,
-                object_id,
-                object_distance
-            ),
-            dim=1
-        )
-
-        object_features = (
-            self.object_state_branch(
-                object_state
-            )
-        )
-
-        # ====================================================
-        # IMAGE
-        # ====================================================
-
-        vision_features = (
-            self.vision_branch(
-                image_input
-            )
-        )
-
-        # ====================================================
-        # FUSION
-        # ====================================================
+        vision_features = self.vision_branch(image_input)
 
         combined_features = torch.cat(
             (
+                vision_features,
                 vehicle_features,
                 junction_features,
                 command_features,
                 next_command_features,
-                object_features,
-                vision_features
             ),
-            dim=1
+            dim=1,
         )
 
-        if combined_features.shape[1] != 724:
+        fused_features = self.fusion_branch(combined_features)
 
-            raise RuntimeError(
-                "Fusion feature size mismatch. "
-                f"Expected 724, "
-                f"got {combined_features.shape[1]}"
-            )
+        steering = self.steering_head(fused_features)
+        throttle = self.throttle_head(fused_features)
+        brake_logits = self.brake_head(fused_features)
 
-        fused_features = (
-            self.fusion_branch(
-                combined_features
-            )
-        )
+        return steering, throttle, brake_logits
 
-        # ====================================================
-        # OUTPUTS
-        # ====================================================
-
-        steering = (
-            self.steering_head(
-                fused_features
-            )
-        )
-
-        throttle = (
-            self.throttle_head(
-                fused_features
-            )
-        )
-
-        brake_logit = (
-            self.brake_head(
-                fused_features
-            )
-        )
-
-        # ====================================================
-        # FINAL OUTPUT
-        #
-        # [steering, throttle, brake_logit]
-        # ====================================================
-
-        return torch.cat(
-            (
-                steering,
-                throttle,
-                brake_logit
-            ),
-            dim=1
-        )
-
-
-# ============================================================
-# TRAINING
-# ============================================================
-
-def train_model(
-    model,
-    train_loader,
-    val_loader,
-    device,
-    epochs=15,
-    learning_rate=2e-5
-):
-
-    # ========================================================
-    # OPTIMIZER
-    # ========================================================
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=1e-4
-    )
-
-    # ========================================================
-    # LOSSES
-    # ========================================================
-
-    regression_criterion = nn.HuberLoss(
-        reduction="none"
-    )
-
-    brake_criterion = nn.BCEWithLogitsLoss(
-        reduction="none"
-    )
-
-    # ========================================================
-    # OUTPUT WEIGHTS
-    #
-    # Steering receives 2x weight.
-    # ========================================================
-
-    output_weights = torch.tensor(
-        [
-            2.0,
-            1.0,
-            1.0
-        ],
-        dtype=torch.float32,
-        device=device
-    )
-
-    best_val_loss = float("inf")
-    best_epoch = 0
-
-    # ========================================================
-    # EPOCH LOOP
-    # ========================================================
-
-    for epoch in range(epochs):
-
-        # ====================================================
-        # TRAIN MODE
-        # ====================================================
-
-        model.train()
-
-        running_loss = 0.0
-
-        train_absolute_error = torch.zeros(
-            3,
-            device=device
-        )
-
-        train_samples = 0
-
-        # ====================================================
-        # TRAIN BATCHES
-        # ====================================================
-
-        for batch_idx, (
-            images,
-            telemetry,
-            targets
-        ) in enumerate(
-            train_loader,
-            start=1
-        ):
-
-            images = images.to(
-                device,
-                non_blocking=True
-            )
-
-            telemetry = telemetry.to(
-                device,
-                non_blocking=True
-            )
-
-            targets = targets.to(
-                device,
-                non_blocking=True
-            )
-
-            # ------------------------------------------------
-            # VALIDATION OF INPUT SHAPES
-            # ------------------------------------------------
-
-            if telemetry.shape[1] != NUM_TELEMETRY:
-
-                raise RuntimeError(
-                    "Training dataset returned "
-                    f"{telemetry.shape[1]} telemetry values. "
-                    f"Expected {NUM_TELEMETRY}."
-                )
-
-            if targets.shape[1] != 3:
-
-                raise RuntimeError(
-                    "Training dataset returned "
-                    f"{targets.shape[1]} targets. "
-                    "Expected 3."
-                )
-
-            # ------------------------------------------------
-            # NUMERICAL CHECK
-            # ------------------------------------------------
-
-            if not torch.isfinite(images).all():
-
-                raise RuntimeError(
-                    "Image contains NaN/Inf."
-                )
-
-            if not torch.isfinite(telemetry).all():
-
-                raise RuntimeError(
-                    "Telemetry contains NaN/Inf."
-                )
-
-            if not torch.isfinite(targets).all():
-
-                raise RuntimeError(
-                    "Targets contain NaN/Inf."
-                )
-
-            # ------------------------------------------------
-            # ZERO GRADIENT
-            # ------------------------------------------------
-
-            optimizer.zero_grad(
-                set_to_none=True
-            )
-
-            # ------------------------------------------------
-            # FORWARD
-            # ------------------------------------------------
-
-            outputs = model(
-                images,
-                telemetry
-            )
-
-            # =================================================
-            # STEERING LOSS
-            # =================================================
-
-            steer_loss = regression_criterion(
-                outputs[:, 0],
-                targets[:, 0]
-            )
-
-            # =================================================
-            # THROTTLE LOSS
-            # =================================================
-
-            throttle_loss = regression_criterion(
-                outputs[:, 1],
-                targets[:, 1]
-            )
-
-            # =================================================
-            # BRAKE LOSS
-            # =================================================
-
-            brake_loss = brake_criterion(
-                outputs[:, 2],
-                targets[:, 2]
-            )
-
-            # =================================================
-            # COMBINE
-            # =================================================
-
-            individual_loss = torch.stack(
-                (
-                    steer_loss,
-                    throttle_loss,
-                    brake_loss
-                ),
-                dim=1
-            )
-
-            weighted_loss = (
-                individual_loss
-                * output_weights
-            )
-
-            loss = weighted_loss.mean()
-
-            # =================================================
-            # BACKPROP
-            # =================================================
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=1.0
-            )
-
-            optimizer.step()
-
-            # =================================================
-            # METRICS
-            # =================================================
-
-            batch_size = images.size(0)
-
-            running_loss += (
-                loss.item()
-                * batch_size
-            )
-
-            with torch.no_grad():
-
-                brake_probability = torch.sigmoid(
-                    outputs[:, 2]
-                )
-
-                brake_prediction = (
-                    brake_probability >= 0.5
-                ).float()
-
-                batch_error = torch.stack(
-                    (
-                        torch.abs(
-                            outputs[:, 0]
-                            -
-                            targets[:, 0]
-                        ),
-
-                        torch.abs(
-                            outputs[:, 1]
-                            -
-                            targets[:, 1]
-                        ),
-
-                        torch.abs(
-                            brake_prediction
-                            -
-                            targets[:, 2]
-                        )
-                    ),
-                    dim=1
-                )
-
-                train_absolute_error += (
-                    batch_error.sum(
-                        dim=0
-                    )
-                )
-
-            train_samples += batch_size
-
-            # ------------------------------------------------
-            # PROGRESS
-            # ------------------------------------------------
-
-            if batch_idx % 100 == 0:
-
-                print(
-                    f"[Epoch {epoch + 1}, "
-                    f"Batch {batch_idx}] "
-                    f"train_loss: "
-                    f"{running_loss / train_samples:.4f}"
-                )
-
-        # ====================================================
-        # TRAIN METRICS
-        # ====================================================
-
-        train_loss = (
-            running_loss
-            /
-            max(train_samples, 1)
-        )
-
-        train_mae = (
-            train_absolute_error
-            /
-            max(train_samples, 1)
-        )
-
-        # ====================================================
-        # VALIDATION
-        # ====================================================
-
-        model.eval()
-
-        val_loss_total = 0.0
-
-        val_output_loss = torch.zeros(
-            3,
-            device=device
-        )
-
-        val_absolute_error = torch.zeros(
-            3,
-            device=device
-        )
-
-        val_samples = 0
-
-        # ====================================================
-        # BRAKE CONFUSION MATRIX
-        # ====================================================
-
-        brake_tp = 0
-        brake_tn = 0
-        brake_fp = 0
-        brake_fn = 0
-
-        # ====================================================
-        # STEERING METRICS
-        # ====================================================
-
-        steer_sign_correct = 0
-        steer_sign_total = 0
-
-        strong_steer_error = 0.0
-        strong_steer_samples = 0
-
-        # ====================================================
-        # VALIDATION LOOP
-        # ====================================================
-
-        with torch.no_grad():
-
-            for (
-                images,
-                telemetry,
-                targets
-            ) in val_loader:
-
-                images = images.to(
-                    device,
-                    non_blocking=True
-                )
-
-                telemetry = telemetry.to(
-                    device,
-                    non_blocking=True
-                )
-
-                targets = targets.to(
-                    device,
-                    non_blocking=True
-                )
-
-                # ------------------------------------------------
-                # SHAPE CHECK
-                # ------------------------------------------------
-
-                if telemetry.shape[1] != NUM_TELEMETRY:
-
-                    raise RuntimeError(
-                        "Validation dataset returned "
-                        f"{telemetry.shape[1]} telemetry values. "
-                        f"Expected {NUM_TELEMETRY}."
-                    )
-
-                # ------------------------------------------------
-                # FORWARD
-                # ------------------------------------------------
-
-                outputs = model(
-                    images,
-                    telemetry
-                )
-
-                # =================================================
-                # LOSSES
-                # =================================================
-
-                steer_loss = regression_criterion(
-                    outputs[:, 0],
-                    targets[:, 0]
-                )
-
-                throttle_loss = regression_criterion(
-                    outputs[:, 1],
-                    targets[:, 1]
-                )
-
-                brake_loss = brake_criterion(
-                    outputs[:, 2],
-                    targets[:, 2]
-                )
-
-                individual_loss = torch.stack(
-                    (
-                        steer_loss,
-                        throttle_loss,
-                        brake_loss
-                    ),
-                    dim=1
-                )
-
-                weighted_loss = (
-                    individual_loss
-                    * output_weights
-                )
-
-                loss = weighted_loss.mean()
-
-                batch_size = images.size(0)
-
-                val_loss_total += (
-                    loss.item()
-                    * batch_size
-                )
-
-                val_output_loss += (
-                    individual_loss.sum(
-                        dim=0
-                    )
-                )
-
-                # =================================================
-                # BRAKE PREDICTION
-                # =================================================
-
-                brake_probability = torch.sigmoid(
-                    outputs[:, 2]
-                )
-
-                brake_prediction = (
-                    brake_probability >= 0.5
-                ).float()
-
-                # =================================================
-                # MAE
-                # =================================================
-
-                batch_error = torch.stack(
-                    (
-                        torch.abs(
-                            outputs[:, 0]
-                            -
-                            targets[:, 0]
-                        ),
-
-                        torch.abs(
-                            outputs[:, 1]
-                            -
-                            targets[:, 1]
-                        ),
-
-                        torch.abs(
-                            brake_prediction
-                            -
-                            targets[:, 2]
-                        )
-                    ),
-                    dim=1
-                )
-
-                val_absolute_error += (
-                    batch_error.sum(
-                        dim=0
-                    )
-                )
-
-                # =================================================
-                # BRAKE CONFUSION MATRIX
-                # =================================================
-
-                actual_brake = targets[:, 2]
-
-                brake_tp += (
-                    (
-                        (brake_prediction == 1)
-                        &
-                        (actual_brake == 1)
-                    )
-                    .sum()
-                    .item()
-                )
-
-                brake_tn += (
-                    (
-                        (brake_prediction == 0)
-                        &
-                        (actual_brake == 0)
-                    )
-                    .sum()
-                    .item()
-                )
-
-                brake_fp += (
-                    (
-                        (brake_prediction == 1)
-                        &
-                        (actual_brake == 0)
-                    )
-                    .sum()
-                    .item()
-                )
-
-                brake_fn += (
-                    (
-                        (brake_prediction == 0)
-                        &
-                        (actual_brake == 1)
-                    )
-                    .sum()
-                    .item()
-                )
-
-                # =================================================
-                # STEERING SIGN ACCURACY
-                # =================================================
-
-                meaningful = (
-                    torch.abs(
-                        targets[:, 0]
-                    )
-                    >=
-                    0.05
-                )
-
-                if meaningful.any():
-
-                    true_sign = torch.sign(
-                        targets[:, 0][meaningful]
-                    )
-
-                    pred_sign = torch.sign(
-                        outputs[:, 0][meaningful]
-                    )
-
-                    steer_sign_correct += (
-                        (
-                            true_sign
-                            ==
-                            pred_sign
-                        )
-                        .sum()
-                        .item()
-                    )
-
-                    steer_sign_total += (
-                        meaningful.sum().item()
-                    )
-
-                # =================================================
-                # STRONG TURN MAE
-                # =================================================
-
-                strong = (
-                    torch.abs(
-                        targets[:, 0]
-                    )
-                    >=
-                    0.25
-                )
-
-                if strong.any():
-
-                    strong_error = torch.abs(
-                        outputs[:, 0][strong]
-                        -
-                        targets[:, 0][strong]
-                    )
-
-                    strong_steer_error += (
-                        strong_error.sum().item()
-                    )
-
-                    strong_steer_samples += (
-                        strong.sum().item()
-                    )
-
-                val_samples += batch_size
-
-        # ====================================================
-        # VALIDATION METRICS
-        # ====================================================
-
-        val_loss = (
-            val_loss_total
-            /
-            max(val_samples, 1)
-        )
-
-        val_mae = (
-            val_absolute_error
-            /
-            max(val_samples, 1)
-        )
-
-        val_output_loss_avg = (
-            val_output_loss
-            /
-            max(val_samples, 1)
-        )
-
-        # ====================================================
-        # BRAKE METRICS
-        # ====================================================
-
-        brake_total = (
-            brake_tp
-            +
-            brake_tn
-            +
-            brake_fp
-            +
-            brake_fn
-        )
-
-        brake_accuracy = (
-            (brake_tp + brake_tn)
-            /
-            brake_total
-            if brake_total > 0
-            else 0.0
-        )
-
-        brake_precision = (
-            brake_tp
-            /
-            (brake_tp + brake_fp)
-            if (brake_tp + brake_fp) > 0
-            else 0.0
-        )
-
-        brake_recall = (
-            brake_tp
-            /
-            (brake_tp + brake_fn)
-            if (brake_tp + brake_fn) > 0
-            else 0.0
-        )
-
-        # ====================================================
-        # STEERING METRICS
-        # ====================================================
-
-        steer_sign_accuracy = (
-            steer_sign_correct
-            /
-            steer_sign_total
-            if steer_sign_total > 0
-            else 0.0
-        )
-
-        strong_turn_mae = (
-            strong_steer_error
-            /
-            strong_steer_samples
-            if strong_steer_samples > 0
-            else 0.0
-        )
-
-        # ====================================================
-        # PRINT
-        # ====================================================
-
-        print()
-        print("=" * 80)
-
-        print(
-            f"--- End of Epoch {epoch + 1} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} ---"
-        )
-
-        print(
-            f"Train MAE | "
-            f"Steer: {train_mae[0]:.4f} | "
-            f"Throttle: {train_mae[1]:.4f} | "
-            f"Brake: {train_mae[2]:.4f}"
-        )
-
-        print(
-            f"Val MAE   | "
-            f"Steer: {val_mae[0]:.4f} | "
-            f"Throttle: {val_mae[1]:.4f} | "
-            f"Brake: {val_mae[2]:.4f}"
-        )
-
-        print(
-            f"Val Loss  | "
-            f"Steer: {val_output_loss_avg[0]:.4f} | "
-            f"Throttle: {val_output_loss_avg[1]:.4f} | "
-            f"Brake BCE: {val_output_loss_avg[2]:.4f}"
-        )
-
-        print(
-            f"Steer Metrics | "
-            f"Sign Accuracy: "
-            f"{steer_sign_accuracy:.4f} | "
-            f"Strong-turn MAE: "
-            f"{strong_turn_mae:.4f}"
-        )
-
-        print(
-            f"Brake Metrics | "
-            f"Accuracy: "
-            f"{brake_accuracy:.4f} | "
-            f"Precision: "
-            f"{brake_precision:.4f} | "
-            f"Recall: "
-            f"{brake_recall:.4f}"
-        )
-
-        print(
-            f"Brake Confusion | "
-            f"TP: {brake_tp} | "
-            f"TN: {brake_tn} | "
-            f"FP: {brake_fp} | "
-            f"FN: {brake_fn}"
-        )
-
-        print("=" * 80)
-
-        # ====================================================
-        # SAVE BEST MODEL
-        # ====================================================
-
-        if val_loss < best_val_loss:
-
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
-
-            torch.save(
-                model.state_dict(),
-                CHECKPOINT
-            )
-
-            print(
-                f">>> Validation loss decreased! "
-                f"Saved {CHECKPOINT} <<<"
-            )
-
-    # ========================================================
-    # COMPLETE
-    # ========================================================
-
-    print()
-    print("=" * 80)
-
-    print(
-        "TRAINING COMPLETE"
-    )
-
-    print(
-        f"Best epoch: {best_epoch}"
-    )
-
-    print(
-        f"Best validation loss: "
-        f"{best_val_loss:.6f}"
-    )
-
-    print(
-        f"Checkpoint: {CHECKPOINT}"
-    )
-
-    print("=" * 80)
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
 
-    # ========================================================
-    # DATA PATHS
-    # ========================================================
-
-    BASE_PATHS = [
-        "./PDM_Lite_Carla_LB2_Data/Town01/data/*",
-        "./PDM_Lite_Carla_LB2_Data/Town02/data/*",
-        "./PDM_Lite_Carla_LB2_Data/Town03/data/*/*",
-        "./PDM_Lite_Carla_LB2_Data/Town04/data/*"
-    ]
-
-    # ========================================================
-    # RANDOM SEEDS
-    # ========================================================
+    # Route-based split across ALL towns: for each (town, scenario)
+    # the routes are sorted and split ~80/20 (first 80% train, last
+    # 20% validation), so validation holds out entire held-out routes
+    # rather than whole towns.
+    DATA_DIR = "./PDM_Lite_Carla_LB2_Data"
 
     random.seed(SEED)
-
     np.random.seed(SEED)
-
     torch.manual_seed(SEED)
-
     if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
-        torch.cuda.manual_seed_all(
-            SEED
-        )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ========================================================
-    # DEVICE
-    # ========================================================
+    train_list, val_list = build_route_split(DATA_DIR, val_fraction=0.2)
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    print(f"Training samples: {len(train_list)}")
+    print(f"Validation samples: {len(val_list)}")
 
-    # ========================================================
-    # HEADER
-    # ========================================================
-
-    print()
-    print("=" * 80)
-
-    print(
-        "PDM-LITE NEURAL DRIVER TRAINING V8"
-    )
-
-    print("=" * 80)
-
-    print(
-        f"Device: {device}"
-    )
-
-    print(
-        f"Telemetry: {NUM_TELEMETRY}"
-    )
-
-    print(
-        f"Checkpoint: {CHECKPOINT}"
-    )
-
-    print(
-        "Steering strategy:"
-    )
-
-    print(
-        "  sqrt inverse-frequency sampling"
-    )
-
-    print(
-        "  Huber steering loss"
-    )
-
-    print(
-        "Brake input:"
-    )
-
-    print(
-        "  REMOVED"
-    )
-
-    print(
-        "Brake:"
-    )
-
-    print(
-        "  target only"
-    )
-
-    print(
-        "Lateral distance:"
-    )
-
-    print(
-        "  route-based"
-    )
-
-    print(
-        "  normalized to [-1, 1]"
-    )
-
-    print("=" * 80)
-
-    # ========================================================
-    # BUILD INDEX
-    # ========================================================
-
-    master_list = build_path_index(
-        BASE_PATHS
-    )
-
-    print(
-        "Total indexed samples:",
-        len(master_list)
-    )
-
-    if len(master_list) == 0:
-
-        raise RuntimeError(
-            "No training samples found."
-        )
-
-    # ========================================================
-    # DATASET DISTRIBUTION
-    # ========================================================
-
-    summarize_steering_distribution(
-        master_list
-    )
-
-    # ========================================================
-    # SHUFFLE
-    # ========================================================
-
-    random.shuffle(
-        master_list
-    )
-
-    # ========================================================
-    # TRAIN / VALIDATION SPLIT
-    # ========================================================
-
-    val_size = int(
-        len(master_list)
-        *
-        VAL_RATIO
-    )
-
-    val_list = master_list[
-        :val_size
-    ]
-
-    train_list = master_list[
-        val_size:
-    ]
-
-    print()
-    print(
-        "Training samples:",
-        len(train_list)
-    )
-
-    print(
-        "Validation samples:",
-        len(val_list)
-    )
-
-    # ========================================================
-    # DATASETS
-    # ========================================================
-
-    train_dataset = CarlaDataset(
-        train_list
-    )
-
-    val_dataset = CarlaDataset(
-        val_list
-    )
-
-    # ========================================================
-    # DATASET CHECK
-    # ========================================================
-
-    print()
-    print(
-        "Checking dataset interface..."
-    )
-
-    sample_image, sample_telemetry, sample_target = (
-        train_dataset[0]
-    )
-
-    print(
-        "Image shape:",
-        tuple(sample_image.shape)
-    )
-
-    print(
-        "Telemetry shape:",
-        tuple(sample_telemetry.shape)
-    )
-
-    print(
-        "Target shape:",
-        tuple(sample_target.shape)
-    )
+    summarize_steering_distribution(train_list)
+    print("--- Validation ---")
+    summarize_steering_distribution(val_list)
 
     # --------------------------------------------------------
-    # IMAGE CHECK
+    # Per-output loss weights, computed directly from the training
+    # data (no assumed scales).
+    #
+    # `compute_loss_weights` returns the baseline loss a trivial
+    # constant predictor achieves on each task:
+    #   steer    -> MSE of predicting the mean steer  (= variance)
+    #   throttle -> MSE of predicting the mean throttle (= variance)
+    #   brake    -> cross-entropy of the marginal class dist
+    #
+    # We weight each task by the INVERSE of its baseline, so every
+    # term starts contributing ~1.0 to the weighted total.
     # --------------------------------------------------------
+    loss_weights = compute_loss_weights(train_list)
+    w1 = 1.0 / loss_weights["steer"]
+    w2 = 1.0 / loss_weights["throttle"]
+    w3 = 1.0 / loss_weights["brake"]
+    print("\nOutput weights (inverse of data-derived baseline loss):")
+    print(f"  w1 (steer)    = 1/{loss_weights['steer']:.6f} = {w1:.3f}")
+    print(f"  w2 (throttle) = 1/{loss_weights['throttle']:.6f} = {w2:.3f}")
+    print(f"  w3 (brake)    = 1/{loss_weights['brake']:.6f} = {w3:.3f} "
+          f"(brake rate {loss_weights['counts']['p_brake']:.3f}, "
+          f"n={loss_weights['counts']['n']})")
 
-    if tuple(sample_image.shape) != (
-        3,
-        200,
-        400
-    ):
+    train_dataset = CarlaDataset(train_list)
+    val_dataset = CarlaDataset(val_list)
 
-        raise RuntimeError(
-            "Unexpected image shape: "
-            f"{sample_image.shape}"
-        )
-
-    # --------------------------------------------------------
-    # TELEMETRY CHECK
-    # --------------------------------------------------------
-
-    if sample_telemetry.numel() != NUM_TELEMETRY:
-
-        raise RuntimeError(
-            "Dataset must return exactly "
-            f"{NUM_TELEMETRY} telemetry values."
-        )
-
-    # --------------------------------------------------------
-    # TARGET CHECK
-    # --------------------------------------------------------
-
-    if sample_target.numel() != 3:
-
-        raise RuntimeError(
-            "Dataset must return exactly "
-            "3 targets."
-        )
-
-    print(
-        "Dataset interface: OK"
-    )
-
-    # ========================================================
-    # STEERING SAMPLING
-    # ========================================================
-
-    sample_weights, train_counts = (
-        get_steering_sampling_weights(
-            train_list
-        )
-    )
-
-    print()
-    print(
-        "Training steering buckets:"
-    )
-
-    for name in (
-        "strong_left",
-        "left",
-        "straight",
-        "right",
-        "strong_right"
-    ):
-
-        print(
-            f"{name:>13}: "
-            f"{train_counts[name]:6d}"
-        )
-
-    sample_weights = torch.tensor(
-        sample_weights,
-        dtype=torch.double
-    )
-
-    # ========================================================
-    # WEIGHTED SAMPLER
-    # ========================================================
+    # WeightedRandomSampler for balanced steering distribution
+    sample_weights, train_counts = get_steering_sampling_weights(train_list)
+    sample_weights = torch.tensor(sample_weights, dtype=torch.double)
 
     sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -1517,87 +215,206 @@ if __name__ == "__main__":
         replacement=True
     )
 
-    # ========================================================
-    # DATA LOADERS
-    # ========================================================
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
+        num_workers=8,
         sampler=sampler,
-        num_workers=4,
-        pin_memory=(
-            device.type == "cuda"
-        ),
-        drop_last=False
+        pin_memory=(device.type == "cuda")
+    )
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4, shuffle=False)
+
+    model = AutonomousDriver().to(device)
+    print(f"Training device: {device}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Vision output features: {model.vision_out_dim}")
+
+    # Single optimizer over all parameters. Heavier weight decay on
+    # the shared backbone to regularize the memorization that made
+    # the brake head overfit; lighter on the task heads.
+    shared_params = (
+        list(model.vision_branch.parameters())
+        + list(model.vehicle_state_branch.parameters())
+        + list(model.junction_state_branch.parameters())
+        + list(model.command_embedding.parameters())
+        + list(model.next_command_embedding.parameters())
+        + list(model.fusion_branch.parameters())
+    )
+    head_params = (
+        list(model.steering_head.parameters())
+        + list(model.throttle_head.parameters())
+        + list(model.brake_head.parameters())
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=(
-            device.type == "cuda"
-        ),
-        drop_last=False
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": shared_params, "weight_decay": 1e-3},
+            {"params": head_params, "weight_decay": 1e-4},
+        ],
+        lr=LEARNING_RATE,
     )
 
-    # ========================================================
-    # MODEL
-    # ========================================================
-
-    model = AutonomousDriver().to(
-        device
+    # One ReduceLROnPlateau over the single weighted validation loss.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
     )
 
-    # ========================================================
-    # PARAMETER COUNT
-    # ========================================================
+    mse_criterion = nn.MSELoss()
 
-    parameter_count = sum(
-        p.numel()
-        for p in model.parameters()
-    )
+    ce_criterion = nn.CrossEntropyLoss()
 
-    print()
-    print(
-        "Model parameters:",
-        f"{parameter_count:,}"
-    )
+    # --------------------------------------------------------
+    # Loss normalization via fixed output weights.
+    #
+    # Each task's raw loss sits on a different scale. Instead of
+    # assuming those scales (or tracking an EMA), we divide each
+    # raw loss by the baseline loss a trivial constant predictor
+    # achieves on the training data (computed above in
+    # `loss_weights`), so every task contributes ~1.0 to the
+    # total at the start of training.
+    # --------------------------------------------------------
 
-    print(
-        "Fusion input features:",
-        model.fusion_branch[
-            0
-        ].in_features
-    )
+    best_val_loss = float("inf")
 
-    print(
-        "Outputs:"
-    )
+    for epoch in range(EPOCHS):
 
-    print(
-        "  0 = Steering"
-    )
+        model.train()
+        running_loss = 0.0
+        running_steer_loss = 0.0
+        running_throttle_loss = 0.0
+        running_brake_loss = 0.0
+        # Raw (un-normalized) losses for progress tracking.
+        running_raw_steer = 0.0
+        running_raw_throttle = 0.0
+        running_raw_brake = 0.0
+        train_samples = 0
 
-    print(
-        "  1 = Throttle"
-    )
+        for batch_idx, (images, telemetry, targets) in enumerate(train_loader):
+            images = images.to(device, non_blocking=True)
+            telemetry = telemetry.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-    print(
-        "  2 = Brake logit"
-    )
+            steering, throttle, brake_logits = model(images, telemetry)
 
-    # ========================================================
-    # TRAIN
-    # ========================================================
+            # Per-output losses, computed separately.
+            l_steer = mse_criterion(steering.squeeze(-1), targets[:, 0])
+            l_throttle = mse_criterion(throttle.squeeze(-1), targets[:, 1])
+            l_brake = ce_criterion(brake_logits, targets[:, 2].long())
 
-    train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        epochs=EPOCHS,
-        learning_rate=LEARNING_RATE
-    )
+            # Weighted scalar total: total = w1*l_steer + w2*l_throttle + w3*l_brake.
+            steer_term = w1 * l_steer
+            throttle_term = w2 * l_throttle
+            brake_term = w3 * l_brake
+            total = steer_term + throttle_term + brake_term
+
+            # Single backward pass on the weighted total.
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            batch_size = images.size(0)
+            running_loss += total.item() * batch_size
+            running_steer_loss += steer_term.item() * batch_size
+            running_throttle_loss += throttle_term.item() * batch_size
+            running_brake_loss += brake_term.item() * batch_size
+            running_raw_steer += l_steer.item() * batch_size
+            running_raw_throttle += l_throttle.item() * batch_size
+            running_raw_brake += l_brake.item() * batch_size
+            train_samples += batch_size
+
+            if (batch_idx + 1) % 100 == 0:
+                avg_loss = running_loss / max(train_samples, 1)
+                avg_steer = running_steer_loss / max(train_samples, 1)
+                avg_throttle = running_throttle_loss / max(train_samples, 1)
+                avg_brake = running_brake_loss / max(train_samples, 1)
+                print(f"Epoch {epoch+1}/{EPOCHS} | Batch {batch_idx+1}/{len(train_loader)} | "
+                      f"Avg Train Loss: {avg_loss:.4f} (Steer: {avg_steer:.4f}, Throttle: {avg_throttle:.4f}, Brake: {avg_brake:.4f})")
+
+        train_loss = running_loss / max(train_samples, 1)
+        train_steer_loss = running_steer_loss / max(train_samples, 1)
+        train_throttle_loss = running_throttle_loss / max(train_samples, 1)
+        train_brake_loss = running_brake_loss / max(train_samples, 1)
+        train_raw_steer = running_raw_steer / max(train_samples, 1)
+        train_raw_throttle = running_raw_throttle / max(train_samples, 1)
+        train_raw_brake = running_raw_brake / max(train_samples, 1)
+
+        model.eval()
+        val_loss_total = 0.0
+        val_steer_loss = 0.0
+        val_throttle_loss = 0.0
+        val_brake_loss = 0.0
+        # Raw (un-normalized) val losses.
+        val_raw_steer = 0.0
+        val_raw_throttle = 0.0
+        val_raw_brake = 0.0
+        val_samples = 0
+        # Brake prediction accuracy counters (whole batch at a time).
+        val_brake_correct = 0
+        val_brake_total = 0
+
+        with torch.no_grad():
+            for images, telemetry, targets in val_loader:
+                images = images.to(device, non_blocking=True)
+                telemetry = telemetry.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                steering, throttle, brake_logits = model(images, telemetry)
+
+                l_steer = mse_criterion(steering.squeeze(-1), targets[:, 0])
+                l_throttle = mse_criterion(throttle.squeeze(-1), targets[:, 1])
+                l_brake = ce_criterion(brake_logits, targets[:, 2].long())
+
+                # Weighted scalar total: w1*l_steer + w2*l_throttle + w3*l_brake.
+                steer_term = w1 * l_steer
+                throttle_term = w2 * l_throttle
+                brake_term = w3 * l_brake
+                total = steer_term + throttle_term + brake_term
+
+                # Count correct brake-class predictions.
+                brake_pred = brake_logits.argmax(dim=1)
+                val_brake_correct += (
+                    brake_pred == targets[:, 2].long()
+                ).sum().item()
+                val_brake_total += images.size(0)
+
+                batch_size = images.size(0)
+                val_loss_total += total.item() * batch_size
+                val_steer_loss += steer_term.item() * batch_size
+                val_throttle_loss += throttle_term.item() * batch_size
+                val_brake_loss += brake_term.item() * batch_size
+                val_raw_steer += l_steer.item() * batch_size
+                val_raw_throttle += l_throttle.item() * batch_size
+                val_raw_brake += l_brake.item() * batch_size
+                val_samples += batch_size
+
+        val_loss = val_loss_total / max(val_samples, 1)
+        val_steer = val_steer_loss / max(val_samples, 1)
+        val_throttle = val_throttle_loss / max(val_samples, 1)
+        val_brake = val_brake_loss / max(val_samples, 1)
+        val_brake_acc = val_brake_correct / max(val_brake_total, 1)
+        val_raw_steer_avg = val_raw_steer / max(val_samples, 1)
+        val_raw_throttle_avg = val_raw_throttle / max(val_samples, 1)
+        val_raw_brake_avg = val_raw_brake / max(val_samples, 1)
+
+        # Raw losses show actual learning progress (the weighted total
+        # reads ~3.0 per sample by design, ~1.0 per task at start).
+        print(f"Epoch {epoch+1}/{EPOCHS} | "
+              f"Train Loss: {train_loss:.4f} "
+              f"(Steer: {train_steer_loss:.4f}, Throttle: {train_throttle_loss:.4f}, Brake: {train_brake_loss:.4f}) | "
+              f"Val Loss: {val_loss:.4f} "
+              f"(Steer: {val_steer:.4f}, Throttle: {val_throttle:.4f}, Brake: {val_brake:.4f})")
+        print(f"  Raw losses — "
+              f"Train: steer={train_raw_steer:.6f} throttle={train_raw_throttle:.6f} brake={train_raw_brake:.4f} | "
+              f"Val: steer={val_raw_steer_avg:.6f} throttle={val_raw_throttle_avg:.6f} brake={val_raw_brake_avg:.4f}")
+        print(f"  Val brake accuracy: {val_brake_correct}/{val_brake_total} = {val_brake_acc:.4f}")
+
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), CHECKPOINT)
+            print(f"  Saved {CHECKPOINT}")
+
+    print(f"\nBest Val Loss: {best_val_loss:.4f}")
+    print(f"Vision output features: {model.vision_out_dim}")
