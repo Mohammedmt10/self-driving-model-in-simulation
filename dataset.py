@@ -446,7 +446,15 @@ def report_image_spec(title="DATASET LOAD IMAGE SPEC"):
 # ============================================================
 # DATASET
 #
-# EXACTLY 8 TELEMETRY VALUES
+# TELEMETRY VECTOR: 16 VALUES
+#
+#   indices 0..7   original 8 telemetry inputs (consumed by the
+#                  model's AutonomousDriver.forward)
+#   indices 8..15  object / hazard measurements appended from the
+#                  measurement JSON (not yet consumed by the model
+#                  — added so explicit object-distance, hazard and
+#                  object-type signals are available for the next
+#                  model change)
 # ============================================================
 
 class CarlaDataset(Dataset):
@@ -552,6 +560,108 @@ class CarlaDataset(Dataset):
         )
 
         # ====================================================
+        # OBJECT / HAZARD MEASUREMENTS
+        #
+        # New telemetry columns (indices 8..15), appended after
+        # the original 8. These expose explicit object-distance,
+        # hazard and object-type signals to the braking / evasion
+        # policy.
+        # ====================================================
+
+        # Distance (m) to the object currently causing the ego to
+        # reduce speed. Absent when nothing is slowing the ego;
+        # treated as "far away" (500 m) so it normalizes to the
+        # max value ("no obstructing object").
+        obj_dist = telemetry.get(
+            "speed_reduced_by_obj_distance"
+        )
+
+        if obj_dist is None:
+
+            obj_dist = 500.0
+
+        obj_dist = float(
+            obj_dist
+        )
+
+        # Binary hazard flags, cast to 0.0 / 1.0.
+        vehicle_hazard = float(
+            bool(
+                telemetry.get("vehicle_hazard") or False
+            )
+        )
+
+        light_hazard = float(
+            bool(
+                telemetry.get("light_hazard") or False
+            )
+        )
+
+        walker_hazard = float(
+            bool(
+                telemetry.get("walker_hazard") or False
+            )
+        )
+
+        stop_sign_hazard = float(
+            bool(
+                telemetry.get("stop_sign_hazard") or False
+            )
+        )
+
+        stop_sign_close = float(
+            bool(
+                telemetry.get("stop_sign_close") or False
+            )
+        )
+
+        walker_close = float(
+            bool(
+                telemetry.get("walker_close") or False
+            )
+        )
+
+        # Object type / name, collapsed to a category id:
+        #
+        #   0  none (no speed-reducing object)
+        #   1  vehicle
+        #   2  walker / pedestrian
+        #   3  traffic light
+        #   4  stop sign
+        #
+        # The raw string (e.g. "vehicle.lincoln.mkz_2017") has 27
+        # distinct values whose model-specific suffixes ("_2017" vs
+        # "_2020") carry no policy signal, so we keep only the
+        # top-level category. Kept as a small integer (like command)
+        # so the model can embed it.
+        obj_type_raw = (
+            telemetry.get("speed_reduced_by_obj_type") or ""
+        )
+
+        if not obj_type_raw:
+
+            obj_type = 0
+
+        elif obj_type_raw.startswith("vehicle"):
+
+            obj_type = 1
+
+        elif obj_type_raw.startswith("walker"):
+
+            obj_type = 2
+
+        elif obj_type_raw == "traffic.traffic_light":
+
+            obj_type = 3
+
+        else:
+
+            # "traffic.stop" and anything else.
+            obj_type = 4
+
+        obj_type = float(obj_type)
+
+        # ====================================================
         # NORMALIZATION
         # ====================================================
 
@@ -611,17 +721,48 @@ class CarlaDataset(Dataset):
             1.0
         )
 
-        # ====================================================
-        # EXACT 8 INPUTS
+        # ----------------------------------------------------
+        # OBJECT DISTANCE NORMALIZATION.
         #
-        # 0  speed
-        # 1  command
-        # 2  junction
-        # 3  speed_limit
-        # 4  angle
-        # 5  next_command
-        # 6  theta
-        # 7  lateral_distance
+        # 50 m reference, clipped to [0, 2]:
+        #
+        #   0   m -> 0.0   (object right in front)
+        #   50  m -> 1.0
+        #   >=100 m -> 2.0 (far away / no obstructing object)
+        #
+        # A missing value (no speed-reducing object) is treated
+        # as 500 m, which lands at the clipped max of 2.0.
+        # ----------------------------------------------------
+
+        obj_dist = np.clip(
+            obj_dist / 50.0,
+            0.0,
+            2.0
+        )
+
+        # ====================================================
+        # TELEMETRY INPUT
+        #
+        # Original 8 (run through the model today):
+        #   0  speed
+        #   1  command
+        #   2  junction
+        #   3  speed_limit
+        #   4  angle
+        #   5  next_command
+        #   6  theta
+        #   7  lateral_distance
+        #
+        # Appended object / hazard measurements:
+        #   8  obj_dist           (normalized; 2.0 = far/none)
+        #   9  vehicle_hazard
+        #   10 light_hazard
+        #   11 walker_hazard
+        #   12 stop_sign_hazard
+        #   13 stop_sign_close
+        #   14 walker_close
+        #   15 obj_type           (category id 0-4, NOT normalized:
+        #                         embed like command)
         # ====================================================
 
         telemetry_tensor = torch.tensor(
@@ -634,6 +775,14 @@ class CarlaDataset(Dataset):
                 next_command,
                 theta,
                 lateral_distance,
+                obj_dist,
+                vehicle_hazard,
+                light_hazard,
+                walker_hazard,
+                stop_sign_hazard,
+                stop_sign_close,
+                walker_close,
+                obj_type,
             ],
             dtype=torch.float32
         )

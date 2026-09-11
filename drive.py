@@ -23,7 +23,7 @@ PROJECT_DIR = os.path.dirname(
 
 MODEL_FILE = os.path.join(
     PROJECT_DIR,
-    "model_v14.pth"
+    "model_v15.pth"
 )
 
 DRIVELM_ROOT = os.path.expanduser(
@@ -108,7 +108,7 @@ DEVICE = torch.device(
 
 MODEL_WIDTH = 480
 MODEL_HEIGHT = 240
-MODEL_TELEMETRY = 8
+MODEL_TELEMETRY = 16
 
 # Fraction of the top of each camera frame to drop before feeding
 # the model, so inference matches dataset.py.  The dataset crops the
@@ -152,11 +152,22 @@ VEHICLE_FILTER = "vehicle.tesla.model3"
 
 
 # ============================================================
+# TRAFFIC
+#
+# How much NPC traffic/objects to place in the world when driving.
+# ============================================================
+
+TRAFFIC_VEHICLES = 40      # autopilot NPC cars placed on the map
+TRAFFIC_STATIC_PROPS = 10  # static scenery props beside the road
+TRAFFIC_PORT = 8000        # TrafficManager port (server-side)
+
+
+# ============================================================
 # CONTROL
 # ============================================================
 
 BRAKE_THRESHOLD = 0.50
-MAX_THROTTLE = 0.40
+MAX_THROTTLE = 0.60
 
 # --- Steering Stability & Smoothness ---
 # Simplified single-stage EMA smoothing.  The previous double-EMA + rate
@@ -179,7 +190,6 @@ PRINT_TELEMETRY = True
 # ============================================================
 # TOWNS
 # ============================================================
-
 TOWNS = [
     "Town01",
     "Town02",
@@ -788,6 +798,117 @@ def spawn_vehicle(world):
     raise RuntimeError(
         "Could not spawn ego vehicle."
     )
+
+
+# ============================================================
+# TRAFFIC
+#
+# Populate the world with NPC cars and a little static scenery so
+# the ego drives in a populated scene.  Purely additive: the ego and
+# its route are untouched.  Cars are handed to the TrafficManager
+# (which runs server-side), so they keep driving after setup.
+# ============================================================
+
+def spawn_traffic(
+    world,
+    client,
+    ego,
+    count=TRAFFIC_VEHICLES,
+    props=TRAFFIC_STATIC_PROPS,
+    tm_port=TRAFFIC_PORT
+):
+
+    """Spawn `count` autopilot NPC vehicles + `props` static objects.
+
+    Skips the ego's own blueprint and any spawn point within 40 m of it.
+    Returns the number of vehicles spawned.
+    """
+
+    bp_lib = world.get_blueprint_library()
+
+    # --- NPC vehicles (autopilot via TrafficManager) ---
+    veh_bps = [
+        b
+        for b in bp_lib.filter("vehicle.*")
+        if b.id != VEHICLE_FILTER            # never a mirror of the ego
+        and b.has_attribute("number_of_wheels")
+        and b.get_attribute("number_of_wheels").as_int() == 4
+    ]
+
+    if not veh_bps:
+        print(
+            "spawn_traffic: no NPC vehicle blueprints "
+            "found; skipping."
+        )
+        return 0
+
+    spawn_pts = list(
+        world.get_map().get_spawn_points()
+    )
+    random.shuffle(spawn_pts)
+
+    ego_loc = ego.get_location() if ego is not None else None
+
+    tm = client.get_trafficmanager(tm_port)
+    tm.set_synchronous_mode(
+        world.get_settings().synchronous_mode
+    )
+    tm.global_percentage_speed_difference(10.0)
+    tm.set_global_distance_to_leading_vehicle(2.5)
+
+    spawned = 0
+    failures = 0
+    for pt in spawn_pts:
+        if spawned >= count:
+            break
+        if (
+            ego_loc is not None
+            and pt.location.distance(ego_loc) < 40.0
+        ):
+            continue
+        actor = world.try_spawn_actor(
+            random.choice(veh_bps), pt
+        )
+        if actor is None:
+            failures += 1
+            continue
+        actor.set_autopilot(True, tm_port)
+        spawned += 1
+
+    print(
+        f"Traffic: spawned {spawned} NPC vehicles "
+        f"({failures} spawn failures)."
+    )
+
+    # --- static scenery props beside the road ---
+    prop_bps = bp_lib.filter("static.prop.*")
+    if prop_bps and props > 0:
+        wps = world.get_map().generate_waypoints(60.0)
+        random.shuffle(wps)
+        p_spawned = 0
+        for wp in wps:
+            if p_spawned >= props:
+                break
+            t = wp.transform
+            yaw = math.radians(t.rotation.yaw + 90.0)
+            side = random.choice((-5.0, 5.0))
+            loc = carla.Location(
+                x=t.location.x + side * math.cos(yaw),
+                y=t.location.y + side * math.sin(yaw),
+                z=t.location.z + 0.2,
+            )
+            actor = world.try_spawn_actor(
+                random.choice(prop_bps),
+                carla.Transform(loc, t.rotation),
+            )
+            if actor is None:
+                continue
+            p_spawned += 1
+        print(
+            f"Traffic: placed {p_spawned} static props."
+        )
+
+    return spawned
 
 
 # ============================================================
@@ -2097,6 +2218,351 @@ class CarlaRouteState:
 
 
 # ============================================================
+# HAZARD / OBJECT TELEMETRY
+#
+# model_v15 consumes sixteen telemetry columns.  The first eight
+# (speed / command / junction / speed_limit / angle / next_command /
+# theta / lateral_distance) come from CarlaRouteState; the remaining
+# eight (indices 8..15) are the object / hazard measurements that the
+# training pipeline stored for every frame:
+#
+#   8  obj_dist           normalized distance to the object that is
+#                         currently reducing our target speed
+#   9  vehicle_hazard     a blocking vehicle ahead in our lane
+#   10 light_hazard       a non-green traffic light ahead on the route
+#   11 walker_hazard      a walker ahead in our lane
+#   12 stop_sign_hazard   a stop sign ahead on the route
+#   13 stop_sign_close    stop sign within its trigger volume
+#   14 walker_close       walker close enough to force a slowdown
+#   15 obj_type           category id of the speed-reducing object:
+#                         0 none / 1 vehicle / 2 walker
+#                         3 traffic light / 4 stop sign
+#
+# In training these were written by the PDM-Lite LB2 data collector's
+# heavy forecast-based planner (IDM target speeds + OBB collision
+# prediction).  We reproduce the same fields with a compact free-space /
+# in-lane detector so the model's inputs stay in-distribution, without
+# carrying all of that machinery into drive.py.
+# ============================================================
+
+# Forward detection radius (m) for vehicle / walker hazards.  This is a
+# FIXED window — it must NOT be scaled by the ego's instantaneous speed.
+# A speed-scaled window (v * 2.0s, min 4m) shrinks the moment the model
+# brakes, which makes a blocking vehicle "vanish" just when it matters
+# and flips the reported hazard back to the traffic light (whose radius
+# below is fixed and never shrinks) — the cause of hazard flicker.
+# Mirrors the PDM-Lite free-space / IDM forecast horizon, which flags
+# blocking vehicles within a fixed distance regardless of ego speed.
+HAZARD_OBJECT_RADIUS = 30.0
+
+# How far ahead (m) to walk the route looking for a traffic light /
+# stop sign, matching the PDM-Lite light_radius.
+HAZARD_SIGN_RADIUS = 64.0
+
+# In-lane half-widths (m).  An actor whose ego-local |y| is under these
+# is treated as being in our driving lane.
+HAZARD_VEHICLE_LANE_HALF = 3.0
+HAZARD_WALKER_LANE_HALF = 2.5
+
+# Stop signs stand at the side of the road, offset from lane centre, so
+# a wider lateral band decides whether a sign governs our route.
+HAZARD_SIGN_LANE_HALF = 8.0
+
+
+class CarlaHazardDetector:
+    """Reproduce the object / hazard telemetry (indices 8..15) that
+    model_v15 was trained on, from a light free-space / in-lane check.
+    """
+
+    def __init__(self, world, vehicle, route_state):
+
+        self.world = world
+        self.vehicle = vehicle
+        self.route_state = route_state
+
+        self.obj_distance = None
+        self.obj_type = 0
+        self.vehicle_hazard = False
+        self.light_hazard = False
+        self.walker_hazard = False
+        self.walker_close = False
+        self.stop_sign_hazard = False
+        self.stop_sign_close = False
+
+        # Full hazard picture for this tick: one entry per category
+        # (the closest object of that category), so multiple hazards
+        # are tracked together instead of collapsing to a single one.
+        # Each entry: {"category": str, "type": int, "distance": m}.
+        self.hazards = []
+
+        # Distance (m) to the closest active hazard of any type, or
+        # None when no hazard is present.
+        self.closest_hazard_distance = None
+
+    # ----------------------------------------------------
+    # Helpers
+    # ----------------------------------------------------
+
+    def _forward_distance(self, actor):
+
+        location = actor.get_location()
+
+        local_x, local_y = world_to_ego_xy(
+            self.vehicle,
+            location.x,
+            location.y
+        )
+
+        return local_x, local_y
+
+    def _next_traffic_light(self):
+
+        """Return the NEAREST traffic light governing our driving lane
+        that is AHEAD of the ego, and its trigger-box distance.
+        Returns (None, None) if no qualifying light exists.
+
+        CARLA 0.9.15's Waypoint has no get_traffic_light(); the
+        controlling signal is found via world.get_traffic_lights_from_
+        waypoint(wp, d) — the same call the PDM-Lite planner makes —
+        which returns the lights governing the waypoint's lane within
+        d meters ahead.
+
+        We iterate ALL returned lights, compute ego-local forward
+        distance, and keep only the closest one that is actually
+        ahead (local_x > 0).  This prevents a far-away or behind-ego
+        light from hijacking obj_distance when a vehicle is the real
+        hazard.
+        """
+
+        waypoint = self.world.get_map().get_waypoint(
+            self.vehicle.get_location(),
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+
+        if waypoint is None:
+            return None, None
+
+        lights = self.world.get_traffic_lights_from_waypoint(
+            waypoint, HAZARD_SIGN_RADIUS
+        )
+
+        if not lights:
+            return None, None
+
+        best_light = None
+        best_distance = float("inf")
+
+        for light in lights:
+
+            stop_point = light.get_transform().transform(
+                light.trigger_volume.location
+            )
+
+            local_x, local_y = world_to_ego_xy(
+                self.vehicle,
+                stop_point.x,
+                stop_point.y
+            )
+
+            # Only consider lights that are AHEAD of the ego.
+            if local_x <= 0.0:
+                continue
+
+            distance = stop_point.distance(
+                self.vehicle.get_location()
+            )
+
+            if distance < best_distance:
+                best_distance = distance
+                best_light = light
+
+        if best_light is None:
+            return None, None
+
+        return best_light, best_distance
+
+    def _next_stop_sign(self):
+
+        """Nearest stop sign standing ahead on our route, or None."""
+
+        best = None
+        best_dist = float("inf")
+
+        for actor in self.world.get_actors().filter("*traffic.stop*"):
+
+            location = actor.get_transform().transform(
+                actor.trigger_volume.location
+            )
+
+            local_x, local_y = world_to_ego_xy(
+                self.vehicle,
+                location.x,
+                location.y
+            )
+
+            if local_x <= 0.0 or local_x > HAZARD_SIGN_RADIUS:
+                continue
+
+            if abs(local_y) > HAZARD_SIGN_LANE_HALF:
+                continue
+
+            dist = math.hypot(local_x, local_y)
+
+            if dist < best_dist:
+                best = (actor, dist)
+                best_dist = dist
+
+        return best
+
+    # ----------------------------------------------------
+    # Per-tick update
+    # ----------------------------------------------------
+
+    def update(self):
+
+        self.vehicle_hazard = False
+        self.light_hazard = False
+        self.walker_hazard = False
+        self.walker_close = False
+        self.stop_sign_hazard = False
+        self.stop_sign_close = False
+        self.obj_distance = None
+        self.obj_type = 0
+        self.hazards = []
+        self.closest_hazard_distance = None
+
+        ego_id = self.vehicle.id
+
+        # Fixed detection radius for all hazard categories, so braking
+        # cannot shrink the window and drop a detected hazard.
+        lookahead = HAZARD_OBJECT_RADIUS
+
+        # Primary (highest-priority) speed-reducing object, used only to
+        # fill the model's SINGLE obj_distance / obj_type slots (the model
+        # was trained on one speed-reducing object per frame).  All the
+        # hazards of the tick are collected in self.hazards below, so
+        # nothing is lost.
+        #
+        # Priority mirrors PDM-Lite's min-target-speed choice: a blocking
+        # vehicle is a hard stop, then walker / red light / stop sign.
+        blocking = None
+
+        # --- vehicles (closest in-lane vehicle ahead) ---
+        closest_vehicle = None
+
+        for actor in self.world.get_actors().filter("*vehicle*"):
+
+            if actor.id == ego_id:
+                continue
+
+            local_x, local_y = self._forward_distance(actor)
+
+            if local_x <= 0.0 or local_x > lookahead:
+                continue
+
+            if abs(local_y) > HAZARD_VEHICLE_LANE_HALF:
+                continue
+
+            self.vehicle_hazard = True
+
+            distance = math.hypot(local_x, local_y)
+
+            # Primary slot: vehicles always outrank other hazard types.
+            if blocking is None or 0 < blocking[0] or (0 == blocking[0] and distance < blocking[1]):
+                blocking = (0, distance, 1)
+
+            # Full list: keep the closest vehicle of the tick.
+            if closest_vehicle is None or distance < closest_vehicle[1]:
+                closest_vehicle = (1, distance)
+
+        if closest_vehicle is not None:
+            self.hazards.append({
+                "category": "vehicle",
+                "type": 1,
+                "distance": closest_vehicle[1],
+            })
+
+        # --- walkers (closest in-lane walker ahead) ---
+        closest_walker = None
+
+        for actor in self.world.get_actors().filter("*walker*"):
+
+            local_x, local_y = self._forward_distance(actor)
+
+            if local_x <= 0.0 or local_x > lookahead:
+                continue
+
+            if abs(local_y) > HAZARD_WALKER_LANE_HALF:
+                continue
+
+            self.walker_hazard = True
+            self.walker_close = True
+
+            distance = math.hypot(local_x, local_y)
+
+            if blocking is None or 1 < blocking[0] or (1 == blocking[0] and distance < blocking[1]):
+                blocking = (1, distance, 2)
+
+            if closest_walker is None or distance < closest_walker[1]:
+                closest_walker = (2, distance)
+
+        if closest_walker is not None:
+            self.hazards.append({
+                "category": "walker",
+                "type": 2,
+                "distance": closest_walker[1],
+            })
+
+        # --- traffic light (nearest non-green ahead) ---
+        light, light_distance = self._next_traffic_light()
+
+        if (
+            light is not None
+            and light.state != carla.TrafficLightState.Green
+        ):
+
+            self.light_hazard = True
+
+            if blocking is None or 2 < blocking[0] or (2 == blocking[0] and light_distance < blocking[1]):
+                blocking = (2, light_distance, 3)
+
+            self.hazards.append({
+                "category": "traffic_light",
+                "type": 3,
+                "distance": light_distance,
+            })
+
+        # --- stop sign (nearest ahead on route) ---
+        stop = self._next_stop_sign()
+
+        if stop is not None:
+
+            self.stop_sign_hazard = True
+            self.stop_sign_close = True
+
+            if blocking is None or 3 < blocking[0] or (3 == blocking[0] and stop[1] < blocking[1]):
+                blocking = (3, stop[1], 4)
+
+            self.hazards.append({
+                "category": "stop_sign",
+                "type": 4,
+                "distance": stop[1],
+            })
+
+        if blocking is not None:
+            self.obj_type = blocking[2]
+            self.obj_distance = blocking[1]
+
+        # Sort the full list with the closest hazard first, and record
+        # the closest of any type for quick reference / display.
+        self.hazards.sort(key=lambda h: h["distance"])
+
+        if self.hazards:
+            self.closest_hazard_distance = self.hazards[0]["distance"]
+
+
+# ============================================================
 # TELEMETRY
 # ============================================================
 
@@ -2108,14 +2574,16 @@ def build_model_telemetry(
     vehicle,
     world,
     route_state,
-    theta
+    theta,
+    hazard
 ):
     """
-    Build 8-dim telemetry for the model.
+    Build 16-dim telemetry for the model, matching the training pipeline.
 
-    Uses CarlaRouteState's precomputed angle/lateral for consistency with training data.
-    The dataset stores angle and lateral computed by the data collector using the same
-    route lookahead logic as CarlaRouteState.
+    Indices 0..7 come from CarlaRouteState (angle/lateral match the data
+    collector's route lookahead logic); indices 8..15 are the object /
+    hazard measurements from CarlaHazardDetector, normalized exactly like
+    dataset.py.
     """
 
     speed_raw = safe_float(
@@ -2154,7 +2622,20 @@ def build_model_telemetry(
 
     # ----------------------------------------------------
     # NORMALIZATION (must match dataset.py exactly)
+    #
+    # Object / hazard columns: object distance uses a 50 m reference
+    # clipped to [0, 2] (a missing / far object -> 2.0, like dataset.py's
+    # 500 m default); the six hazard flags are 0.0 / 1.0; obj_type is a
+    # small category id (0..4) that is embedded, not normalized.
     # ----------------------------------------------------
+
+    obj_distance_raw = (
+        500.0
+        if hazard.obj_distance is None
+        else float(hazard.obj_distance)
+    )
+
+    obj_type = int(hazard.obj_type)
 
     telemetry = np.array(
         [
@@ -2186,11 +2667,25 @@ def build_model_telemetry(
 
             # 7 lateral_distance: clipped to [-1, 1] with 2m reference
             np.clip(lateral_raw / 2.0, -1.0, 1.0),
+
+            # 8 obj_dist: clipped to [0, 2] with 50 m reference
+            np.clip(obj_distance_raw / 50.0, 0.0, 2.0),
+
+            # 9-14 hazard flags: 0.0 / 1.0
+            float(hazard.vehicle_hazard),
+            float(hazard.light_hazard),
+            float(hazard.walker_hazard),
+            float(hazard.stop_sign_hazard),
+            float(hazard.stop_sign_close),
+            float(hazard.walker_close),
+
+            # 15 obj_type: category id (embedded, not normalized)
+            float(obj_type),
         ],
         dtype=np.float32
     )
 
-    if telemetry.shape != (8,):
+    if telemetry.shape != (16,):
         raise RuntimeError(f"Telemetry shape mismatch: {telemetry.shape}")
 
     if not np.all(np.isfinite(telemetry)):
@@ -2202,6 +2697,16 @@ def build_model_telemetry(
         "angle": angle_raw,
         "theta": theta,
         "lateral": lateral_raw,
+        "obj_distance": obj_distance_raw,
+        "obj_type": obj_type,
+        "hazards": list(getattr(hazard, "hazards", [])),
+        "closest_hazard_distance": getattr(hazard, "closest_hazard_distance", None),
+        "vehicle_hazard": bool(hazard.vehicle_hazard),
+        "light_hazard": bool(hazard.light_hazard),
+        "walker_hazard": bool(hazard.walker_hazard),
+        "stop_sign_hazard": bool(hazard.stop_sign_hazard),
+        "stop_sign_close": bool(hazard.stop_sign_close),
+        "walker_close": bool(hazard.walker_close),
         "vehicle_location": [
             vehicle.get_location().x,
             vehicle.get_location().y,
@@ -2382,14 +2887,26 @@ def run_model(
         np.clip(
             throttle.item(),
             0.0,
-            MAX_THROTTLE
+            1.0
         )
     )
 
-    # Brake head is broken (outputs 0.99 for all inputs) due to
-    # overfitting — plain Linear layers with no activations/norm.
-    # Disabled: car uses only steering + throttle from the model.
-    brake_probability = 0.0
+    # Brake head outputs 2-class logits (trained with cross-entropy
+    # against a binary control_brake target).  Softmax turns them into
+    # class probabilities; class 1 is the brake probability — a continuous
+    # value in [0, 1], passed straight through to CARLA as the brake.
+    brake_probs = torch.softmax(
+        brake_logits,
+        dim=1
+    )
+
+    brake_probability = float(
+        np.clip(
+            brake_probs[0, 1].item(),
+            0.0,
+            1.0
+        )
+    )
 
     return (
         steering,
@@ -2414,39 +2931,6 @@ def apply_control(
     speed_ms = get_speed_ms(vehicle)
     speed_kmh = speed_ms * 3.6
 
-    # --- Throttle ---
-    # Cruise-control boost.  The model's throttle head collapses toward
-    # zero on real camera frames (probe of model_v14: throttle ~0.0003 on
-    # non-blank images), so relying on it leaves the car stranded.  Boost
-    # throttle whenever we are below the road speed limit; the model's
-    # request wins when it asks for more.
-    #
-    # A straight proportional curve is too shallow: at low speed it
-    # equalizes against drag and the car settles into a ~2 m/s creep.
-    # Use broad steps so the car actually accelerates up to the limit:
-    #
-    #   >=6 m/s below limit  -> 0.40  (hard pull off the line)
-    #   3-6 m/s below limit  -> 0.32
-    #   1.5-3 m/s below      -> 0.24  (still accelerating)
-    #   <1.5 m/s below       -> 0.00  (at cruise; model takes over)
-    speed_limit_ms = get_carla_speed_limit_ms(vehicle)
-    speed_deficit = max(0.0, speed_limit_ms - speed_ms)
-    if speed_deficit >= 6.0:
-        throttle_boost = 0.40
-    elif speed_deficit >= 3.0:
-        throttle_boost = 0.32
-    elif speed_deficit >= 1.5:
-        throttle_boost = 0.24
-    else:
-        throttle_boost = 0.0
-    throttle = float(
-        np.clip(
-            max(throttle, throttle_boost),
-            0.0,
-            MAX_THROTTLE
-        )
-    )
-
     # --- Steering: single EMA smoothing ---
     # At very low speed (standstill / just started), use less smoothing so
     # the car can actually begin turning.  At higher speed, smooth more to
@@ -2467,24 +2951,21 @@ def apply_control(
     _last_steering = steering
     _last_steering_smoothed = steering_applied
 
-    # --- Brake ---
-    # At very low speeds, require higher brake probability to brake.
-    if speed_kmh < 3.0:
-        effective_brake_threshold = BRAKE_THRESHOLD + 0.3
-    elif speed_kmh < 10.0:
-        effective_brake_threshold = BRAKE_THRESHOLD + 0.15
-    else:
-        effective_brake_threshold = BRAKE_THRESHOLD
-
-    brake = brake_probability >= effective_brake_threshold
-
-    if brake:
+    # --- Brake / throttle arbitration ---
+    # Brake head is a binary classifier, so use the probability only
+    # to decide whether braking is active. Never send throttle and brake
+    # simultaneously.
+    if brake_probability >= BRAKE_THRESHOLD:
+        brake = 1.0
         throttle = 0.0
+    else:
+        brake = 0.0
+        throttle = float(np.clip(throttle, 0.0, MAX_THROTTLE))
 
     control = carla.VehicleControl(
         steer=steering_applied,
         throttle=throttle,
-        brake=(1.0 if brake else 0.0),
+        brake=brake,
         hand_brake=False,
         reverse=False,
         manual_gear_shift=False
@@ -2643,7 +3124,7 @@ def print_debug(
     print("=" * 82)
 
     print(
-        "                 PDM-LITE NEURAL DRIVER V14"
+        "                 PDM-LITE NEURAL DRIVER V15"
     )
 
     print("=" * 82)
@@ -2706,7 +3187,7 @@ def print_debug(
     print("-" * 82)
 
     print(
-        "MODEL INPUT — 8 TELEMETRY"
+        "MODEL INPUT — 16 TELEMETRY"
     )
 
     labels = [
@@ -2718,6 +3199,14 @@ def print_debug(
         "next_command",
         "theta",
         "lateral_distance",
+        "obj_distance",
+        "vehicle_hazard",
+        "light_hazard",
+        "walker_hazard",
+        "stop_sign_hazard",
+        "stop_sign_close",
+        "walker_close",
+        "obj_type",
     ]
 
     for i, label in enumerate(labels):
@@ -2733,12 +3222,54 @@ def print_debug(
                 f"{command_name(telemetry[i])}"
             )
 
+        elif i == 15:
+
+            _obj_names = {0: "none", 1: "vehicle", 2: "walker", 3: "traffic_light", 4: "stop_sign"}
+            _obj_id = int(telemetry[i])
+            print(
+                f"{label:<18}: "
+                f"{_obj_id} ({_obj_names.get(_obj_id, '?')})"
+            )
+
         else:
 
             print(
                 f"{label:<18}: "
                 f"{telemetry[i]:+.6f}"
             )
+
+    print("-" * 82)
+
+    print(
+        "HAZARDS (all active this tick)"
+    )
+
+    hazards = raw.get("hazards", [])
+
+    if hazards:
+
+        closest = raw.get("closest_hazard_distance")
+
+        for item in hazards:
+
+            marker = "  <-- closest" if closest is not None and abs(item["distance"] - closest) < 1e-9 else ""
+
+            print(
+                f"  {item['category']:<14}: "
+                f"{item['distance']:+.2f} m"
+                f"{marker}"
+            )
+
+        print(
+            f"  Closest hazard  : "
+            f"{closest:+.2f} m" if closest is not None else "  Closest hazard  : (none)"
+        )
+
+    else:
+
+        print(
+            "  (none)"
+        )
 
     print("-" * 82)
 
@@ -2885,6 +3416,17 @@ def run_single_route(
                 world.tick()
             print("Anchored vehicle to route start.")
 
+        # Populate the world with NPC traffic + scenery
+        # (autopilot cars start driving immediately via TrafficManager).
+        if TRAFFIC_VEHICLES > 0:
+            spawn_traffic(
+                world,
+                client,
+                vehicle,
+                count=TRAFFIC_VEHICLES,
+                tm_port=TRAFFIC_PORT,
+            )
+
         print()
         print(f"--- Route {route_index + 1}/{num_routes} in {town} ---")
         print(f"  Destination : {destination.location}")
@@ -2971,6 +3513,10 @@ def run_single_route(
             world, vehicle, global_route
         )
 
+        hazard = CarlaHazardDetector(
+            world, vehicle, route_state
+        )
+
         vehicle.apply_control(
             carla.VehicleControl(
                 throttle=0.0, steer=0.0, brake=1.0
@@ -3005,6 +3551,8 @@ def run_single_route(
 
             route_state.update()
 
+            hazard.update()
+
             # Destination reached?
             dist_to_dest = vehicle.get_location().distance(
                 destination.location
@@ -3021,7 +3569,7 @@ def run_single_route(
                 return True
 
             telemetry, raw = build_model_telemetry(
-                vehicle, world, route_state, theta
+                vehicle, world, route_state, theta, hazard
             )
 
             # Sanity checks
@@ -3134,12 +3682,13 @@ def run_single_route(
 
 def main():
 
-    global MODEL_FILE, BRAKE_THRESHOLD, PRINT_TELEMETRY
+    global MODEL_FILE, BRAKE_THRESHOLD, PRINT_TELEMETRY, \
+        TRAFFIC_VEHICLES, TRAFFIC_PORT
     global _last_steering, _last_steering_smoothed
 
     parser = argparse.ArgumentParser(
         description=(
-            "PDM-Lite Neural Driver V14\n\n"
+            "PDM-Lite Neural Driver V15\n\n"
             "Examples:\n"
             "  python drive.py --test-towns\n"
             "    Probe which CARLA towns load OK.\n\n"
@@ -3180,6 +3729,27 @@ def main():
             "Brake when braking probability exceeds "
             "this threshold [0, 1]. "
             f"Default: {BRAKE_THRESHOLD}"
+        )
+    )
+
+    parser.add_argument(
+        "--traffic",
+        type=int,
+        default=TRAFFIC_VEHICLES,
+        help=(
+            "Number of autopilot NPC vehicles to spawn in "
+            "the world before driving (0 disables). "
+            f"Default: {TRAFFIC_VEHICLES}"
+        )
+    )
+
+    parser.add_argument(
+        "--traffic-port",
+        type=int,
+        default=TRAFFIC_PORT,
+        help=(
+            "TrafficManager port that drives the NPC vehicles. "
+            f"Default: {TRAFFIC_PORT}"
         )
     )
 
@@ -3237,6 +3807,9 @@ def main():
         )
     )
 
+    TRAFFIC_VEHICLES = max(0, args.traffic)
+    TRAFFIC_PORT = args.traffic_port
+
     num_routes = max(1, args.num_routes)
 
     if args.quiet:
@@ -3252,7 +3825,7 @@ def main():
     print("=" * 82)
 
     print(
-        "                 PDM-LITE NEURAL DRIVER V14"
+        "                 PDM-LITE NEURAL DRIVER V15"
     )
 
     print("=" * 82)

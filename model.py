@@ -14,7 +14,7 @@ EPOCHS = 15
 LEARNING_RATE = 3e-4
 SEED = 42
 
-CHECKPOINT = "model_v14.pth"
+CHECKPOINT = "model_v15.pth"
 
 
 class AutonomousDriver(nn.Module):
@@ -49,7 +49,7 @@ class AutonomousDriver(nn.Module):
         self.vision_out_dim = 512
 
         self.vehicle_state_branch = nn.Sequential(
-            nn.Linear(5, 128),
+            nn.Linear(6, 128),
             nn.ReLU(),
             nn.RMSNorm(128),
             nn.Dropout(0.4),
@@ -70,13 +70,30 @@ class AutonomousDriver(nn.Module):
             nn.Dropout(0.4),
         )
 
+        # Hazard flags branch: the 6 binary object-hazard signals
+        # (vehicle / light / walker / stop-sign present + close),
+        # treated like a small categorical state similar to junction.
+        self.hazard_state_branch = nn.Sequential(
+            nn.Linear(6, 32),
+            nn.ReLU(),
+            nn.RMSNorm(32),
+            nn.Dropout(0.4),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.RMSNorm(32),
+            nn.Dropout(0.4),
+        )
+
         self.command_embedding = nn.Embedding(7, 16)
         self.next_command_embedding = nn.Embedding(7, 16)
+        # Object category id (0 none / 1 vehicle / 2 walker /
+        # 3 traffic light / 4 stop sign), embedded like command.
+        self.obj_type_embedding = nn.Embedding(7, 16)
 
-        # Fusion: vision(512) + vehicle(128) + junction(16) + command(16)
-        #         + next_command(16) = 688
+        # Fusion: vision(512) + vehicle(128) + hazard(32) + junction(16)
+        #         + command(16) + next_command(16) + obj_type(16) = 736
         self.fusion_branch = nn.Sequential(
-            nn.Linear(512 + 128 + 16 + 16 + 16, 128),
+            nn.Linear(512 + 128 + 32 + 16 + 16 + 16 + 16, 128),
             nn.ReLU(),
             nn.RMSNorm(128),
             nn.Dropout(0.5),
@@ -121,15 +138,41 @@ class AutonomousDriver(nn.Module):
         theta = telemetry_input[:, 6:7]
         lateral_distance = telemetry_input[:, 7:8]
 
+        # New object / hazard columns (indices 8..15).
+        obj_dist = telemetry_input[:, 8:9]
+        vehicle_hazard = telemetry_input[:, 9:10]
+        light_hazard = telemetry_input[:, 10:11]
+        walker_hazard = telemetry_input[:, 11:12]
+        stop_sign_hazard = telemetry_input[:, 12:13]
+        stop_sign_close = telemetry_input[:, 13:14]
+        walker_close = telemetry_input[:, 14:15]
+        obj_type = telemetry_input[:, 15].long().clamp(0, 6)
+
+        # Continuous vehicle state: obj distance joins the
+        # speed / limit / angle / theta / lateral group.
         vehicle_state = torch.cat(
-            (speed, speed_limit, angle, theta, lateral_distance), dim=1
+            (speed, speed_limit, angle, theta, lateral_distance, obj_dist), dim=1
         )
         vehicle_features = self.vehicle_state_branch(vehicle_state)
+
+        hazard_state = torch.cat(
+            (
+                vehicle_hazard,
+                light_hazard,
+                walker_hazard,
+                stop_sign_hazard,
+                stop_sign_close,
+                walker_close,
+            ),
+            dim=1,
+        )
+        hazard_features = self.hazard_state_branch(hazard_state)
 
         junction_features = self.junction_state_branch(junction)
 
         command_features = self.command_embedding(command)
         next_command_features = self.next_command_embedding(next_command)
+        obj_type_features = self.obj_type_embedding(obj_type)
 
         vision_features = self.vision_branch(image_input)
 
@@ -137,9 +180,11 @@ class AutonomousDriver(nn.Module):
             (
                 vision_features,
                 vehicle_features,
+                hazard_features,
                 junction_features,
                 command_features,
                 next_command_features,
+                obj_type_features,
             ),
             dim=1,
         )
@@ -235,9 +280,11 @@ if __name__ == "__main__":
     shared_params = (
         list(model.vision_branch.parameters())
         + list(model.vehicle_state_branch.parameters())
+        + list(model.hazard_state_branch.parameters())
         + list(model.junction_state_branch.parameters())
         + list(model.command_embedding.parameters())
         + list(model.next_command_embedding.parameters())
+        + list(model.obj_type_embedding.parameters())
         + list(model.fusion_branch.parameters())
     )
     head_params = (
