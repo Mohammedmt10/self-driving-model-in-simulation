@@ -266,7 +266,7 @@ COMMAND_NAMES = {
     2: "RIGHT",
     3: "STRAIGHT",
     4: "LANEFOLLOW",
-    5: "CHANGE_LANE_LEFT",
+    5: "CHANGE_LANE_LEaT",
     6: "CHANGE_LANE_RIGHT",
 }
 
@@ -750,7 +750,23 @@ def spawn_vehicle(world):
         spawn_points
     )
 
+    print(
+        f"Available spawn points: {len(spawn_points)} "
+        f"(picking a random one each time)."
+    )
+
+    carla_map = world.get_map()
+
     for transform in spawn_points:
+
+        wp = carla_map.get_waypoint(
+            transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving
+        )
+
+        if wp is None or wp.transform.location.distance(transform.location) > SPAWN_ROAD_TOLERANCE:
+            continue
 
         vehicle = (
             world
@@ -765,6 +781,8 @@ def spawn_vehicle(world):
             vehicle.set_autopilot(
                 False
             )
+            
+            world.tick()
 
             print()
             print(
@@ -1164,6 +1182,19 @@ def choose_destination(
             continue
 
         if len(route) < 10:
+            continue
+
+        first_wp_transform = route[0][0]
+        start_dist = start.location.distance(first_wp_transform.location)
+        if start_dist > ROUTE_START_TOLERANCE:
+            print(f"DEBUG: rejected due to start_dist ({start_dist:.2f}) > ROUTE_START_TOLERANCE ({ROUTE_START_TOLERANCE})")
+            continue
+
+        route_yaw = math.radians(first_wp_transform.rotation.yaw)
+        vehicle_yaw = math.radians(start.rotation.yaw)
+        diff = abs(wrap_angle(route_yaw - vehicle_yaw))
+        if diff > FORWARD_ANGLE_TOLERANCE:
+            print(f"DEBUG: rejected due to angle diff ({diff:.2f}) > FORWARD_ANGLE_TOLERANCE ({FORWARD_ANGLE_TOLERANCE})")
             continue
 
         length = route_length(
@@ -2247,13 +2278,12 @@ class CarlaRouteState:
 
 # Forward detection radius (m) for vehicle / walker hazards.  This is a
 # FIXED window — it must NOT be scaled by the ego's instantaneous speed.
-# A speed-scaled window (v * 2.0s, min 4m) shrinks the moment the model
-# brakes, which makes a blocking vehicle "vanish" just when it matters
-# and flips the reported hazard back to the traffic light (whose radius
-# below is fixed and never shrinks) — the cause of hazard flicker.
 # Mirrors the PDM-Lite free-space / IDM forecast horizon, which flags
 # blocking vehicles within a fixed distance regardless of ego speed.
-HAZARD_OBJECT_RADIUS = 30.0
+# Kept short (~2-3 car lengths) so the vehicle hazard only triggers
+# when the car is genuinely close — avoids "detecting" obstacles that
+# are still far away and allows earlier braking.
+HAZARD_OBJECT_RADIUS = 8.0
 
 # How far ahead (m) to walk the route looking for a traffic light /
 # stop sign, matching the PDM-Lite light_radius.
@@ -3392,29 +3422,10 @@ def run_single_route(
             world, vehicle
         )
 
-        # Anchor on the road
-        route_start_tf = global_route[0][0]
-        road_wp = world.get_map().get_waypoint(
-            route_start_tf.location,
-            project_to_road=True,
-            lane_type=carla.LaneType.Driving,
-        )
-
-        if road_wp is not None:
-            settle_tf = road_wp.transform
-            settle_tf.location.z += 0.30
-            vehicle.set_transform(settle_tf)
-            vehicle.set_target_velocity(
-                carla.Vector3D(x=0.0, y=0.0, z=0.0)
-            )
-            vehicle.apply_control(
-                carla.VehicleControl(
-                    throttle=0.0, steer=0.0, brake=1.0
-                )
-            )
-            for _ in range(20):
-                world.tick()
-            print("Anchored vehicle to route start.")
+        # Drive from the actual random spawn point — no re-anchoring.
+        # The old code teleported the vehicle to global_route[0][0]'s
+        # road waypoint, which converged to the same spot across runs
+        # because the GlobalRoutePlanner snaps to lane centers.
 
         # Populate the world with NPC traffic + scenery
         # (autopilot cars start driving immediately via TrafficManager).
